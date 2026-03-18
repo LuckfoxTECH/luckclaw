@@ -871,6 +871,16 @@ func (p *tuiProgram) viewSessions() string {
 			style = style.Foreground(lipgloss.Color("250"))
 		}
 		listLines = append(listLines, style.Render(line))
+
+		if len(s.RecentMessages) > 0 && i == p.sessionIdx {
+			for _, msg := range s.RecentMessages {
+				msgStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Color("245")).
+					Padding(0, 1).
+					PaddingLeft(4)
+				listLines = append(listLines, msgStyle.Render(msg))
+			}
+		}
 	}
 
 	if len(listLines) == 0 {
@@ -886,7 +896,7 @@ func (p *tuiProgram) viewSessions() string {
 		Render(content)
 
 	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).
-		Render("↑/↓: navigate | enter: switch | d: delete | r: rename | esc/q: back")
+		Render("↑/↓: navigate | enter: switch | d: delete | r: rename | esc/q: back | history shown for selected")
 
 	return lipgloss.JoinVertical(lipgloss.Left, topBar, mainContent, footer)
 }

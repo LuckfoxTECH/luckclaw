@@ -347,11 +347,12 @@ func (m *Manager) SetSummary(key string, summary string) error {
 
 // SessionInfo holds metadata for a session (for list/CLI display).
 type SessionInfo struct {
-	Key       string
-	Summary   string
-	CreatedAt string
-	UpdatedAt string
-	Path      string
+	Key             string
+	Summary         string
+	CreatedAt       string
+	UpdatedAt       string
+	Path            string
+	RecentMessages  []string // Last few message previews for session list display
 }
 
 func (m *Manager) ListSessions() ([]string, error) {
@@ -390,15 +391,34 @@ func (m *Manager) ListSessionInfos() ([]SessionInfo, error) {
 		info := SessionInfo{Key: key, Path: path}
 		if f, err := os.Open(path); err == nil {
 			scanner := bufio.NewScanner(f)
-			if scanner.Scan() {
-				var meta map[string]any
-				if json.Unmarshal(scanner.Bytes(), &meta) == nil && meta["_type"] == "metadata" {
-					info.CreatedAt, _ = meta["created_at"].(string)
-					info.UpdatedAt, _ = meta["updated_at"].(string)
-					if m, ok := meta["metadata"].(map[string]any); ok {
-						info.Summary, _ = m["summary"].(string)
+			var lastMessages []string
+			const maxRecentMessages = 3
+			for scanner.Scan() {
+				var msg map[string]any
+				if json.Unmarshal(scanner.Bytes(), &msg) == nil {
+					if msg["_type"] == "metadata" {
+						info.CreatedAt, _ = msg["created_at"].(string)
+						info.UpdatedAt, _ = msg["updated_at"].(string)
+						if meta, ok := msg["metadata"].(map[string]any); ok {
+							info.Summary, _ = meta["summary"].(string)
+						}
+					} else if role, ok := msg["role"].(string); ok {
+						if content, ok := msg["content"].(string); ok && content != "" {
+							preview := content
+							if len(preview) > 50 {
+								preview = preview[:47] + "..."
+							}
+							preview = role + ": " + preview
+							lastMessages = append(lastMessages, preview)
+							if len(lastMessages) > maxRecentMessages {
+								lastMessages = lastMessages[len(lastMessages)-maxRecentMessages:]
+							}
+						}
 					}
 				}
+			}
+			if len(lastMessages) > 0 {
+				info.RecentMessages = lastMessages
 			}
 			f.Close()
 		}
