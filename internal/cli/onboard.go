@@ -136,7 +136,6 @@ func createSkillsTemplates(workspace string, prevErr error) error {
 		dir     string
 		content string
 	}{
-		{"weather", weatherSkillTemplate},
 		{"clawhub", clawhubSkillTemplate},
 	}
 	for _, s := range skills {
@@ -279,25 +278,6 @@ Example:
 - Summarize today's progress
 - Suggest the next 3 tasks
 - Remind me of any deadlines
-`
-
-const weatherSkillTemplate = `---
-name: weather
-description: Get real-time weather info (via web_search / web_fetch)
-metadata: {"luckclaw":{"always":false,"requires":{"env":["BRAVE_SEARCH_API_KEY"]}}}
----
-
-# Weather Skill
-
-When user asks for real-time weather (e.g. "What's the weather in Shenzhen today?"):
-
-1. Use web_search to search "city name + weather today".
-2. Pick 1-2 trusted sources, use web_fetch to open and extract key info (temp, rain, wind, update time).
-3. Reply briefly with source links.
-
-If web_search returns missing API key:
-
-- Prompt user to configure tools.web.search.apiKey (Brave Search) in ~/.luckclaw/config.json, or set BRAVE_SEARCH_API_KEY env.
 `
 
 const clawhubSkillTemplate = `---
