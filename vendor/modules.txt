@@ -1,0 +1,185 @@
+# github.com/andybalholm/cascadia v1.3.3
+## explicit; go 1.16
+github.com/andybalholm/cascadia
+# github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
+## explicit; go 1.12
+github.com/araddon/dateparse
+# github.com/aymanbagabas/go-osc52/v2 v2.0.1
+## explicit; go 1.16
+github.com/aymanbagabas/go-osc52/v2
+# github.com/charmbracelet/bubbletea v1.3.10
+## explicit; go 1.24.0
+github.com/charmbracelet/bubbletea
+# github.com/charmbracelet/colorprofile v0.4.1
+## explicit; go 1.24.2
+github.com/charmbracelet/colorprofile
+# github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
+## explicit; go 1.18
+github.com/charmbracelet/lipgloss
+# github.com/charmbracelet/x/ansi v0.11.6
+## explicit; go 1.24.2
+github.com/charmbracelet/x/ansi
+github.com/charmbracelet/x/ansi/parser
+# github.com/charmbracelet/x/cellbuf v0.0.15
+## explicit; go 1.24.2
+github.com/charmbracelet/x/cellbuf
+# github.com/charmbracelet/x/term v0.2.2
+## explicit; go 1.24.0
+github.com/charmbracelet/x/term
+# github.com/clipperhouse/displaywidth v0.9.0
+## explicit; go 1.18
+github.com/clipperhouse/displaywidth
+# github.com/clipperhouse/stringish v0.1.1
+## explicit; go 1.18
+github.com/clipperhouse/stringish
+# github.com/clipperhouse/uax29/v2 v2.5.0
+## explicit; go 1.18
+github.com/clipperhouse/uax29/v2/graphemes
+# github.com/common-nighthawk/go-figure v0.0.0-20210622060536-734e95fb86be
+## explicit
+github.com/common-nighthawk/go-figure
+# github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
+## explicit; go 1.16
+github.com/erikgeiser/coninput
+# github.com/go-rod/rod v0.116.2
+## explicit; go 1.21
+github.com/go-rod/rod
+github.com/go-rod/rod/lib/assets
+github.com/go-rod/rod/lib/cdp
+github.com/go-rod/rod/lib/defaults
+github.com/go-rod/rod/lib/devices
+github.com/go-rod/rod/lib/input
+github.com/go-rod/rod/lib/js
+github.com/go-rod/rod/lib/launcher
+github.com/go-rod/rod/lib/launcher/flags
+github.com/go-rod/rod/lib/proto
+github.com/go-rod/rod/lib/utils
+# github.com/go-shiori/dom v0.0.0-20230515143342-73569d674e1c
+## explicit; go 1.20
+github.com/go-shiori/dom
+# github.com/go-shiori/go-readability v0.0.0-20251205110129-5db1dc9836f0
+## explicit; go 1.23
+github.com/go-shiori/go-readability
+github.com/go-shiori/go-readability/internal/re2go
+# github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f
+## explicit
+github.com/gogs/chardet
+# github.com/google/jsonschema-go v0.3.0
+## explicit; go 1.23.0
+github.com/google/jsonschema-go/jsonschema
+# github.com/gorilla/websocket v1.5.3
+## explicit; go 1.12
+github.com/gorilla/websocket
+# github.com/inconshreveable/mousetrap v1.1.0
+## explicit; go 1.18
+github.com/inconshreveable/mousetrap
+# github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
+## explicit; go 1.24.1
+github.com/ledongthuc/pdf
+# github.com/lucasb-eyer/go-colorful v1.3.0
+## explicit; go 1.12
+github.com/lucasb-eyer/go-colorful
+# github.com/mattn/go-isatty v0.0.20
+## explicit; go 1.15
+github.com/mattn/go-isatty
+# github.com/mattn/go-localereader v0.0.1
+## explicit
+github.com/mattn/go-localereader
+# github.com/mattn/go-runewidth v0.0.19
+## explicit; go 1.20
+github.com/mattn/go-runewidth
+# github.com/modelcontextprotocol/go-sdk v1.2.0
+## explicit; go 1.23.0
+github.com/modelcontextprotocol/go-sdk/auth
+github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2
+github.com/modelcontextprotocol/go-sdk/internal/util
+github.com/modelcontextprotocol/go-sdk/internal/xcontext
+github.com/modelcontextprotocol/go-sdk/jsonrpc
+github.com/modelcontextprotocol/go-sdk/mcp
+github.com/modelcontextprotocol/go-sdk/oauthex
+# github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6
+## explicit; go 1.17
+github.com/muesli/ansi
+github.com/muesli/ansi/compressor
+# github.com/muesli/cancelreader v0.2.2
+## explicit; go 1.17
+github.com/muesli/cancelreader
+# github.com/muesli/termenv v0.16.0
+## explicit; go 1.17
+github.com/muesli/termenv
+# github.com/rivo/uniseg v0.4.7
+## explicit; go 1.18
+github.com/rivo/uniseg
+# github.com/robfig/cron/v3 v3.0.1
+## explicit; go 1.12
+github.com/robfig/cron/v3
+# github.com/sergi/go-diff v1.3.1
+## explicit; go 1.12
+# github.com/spf13/cobra v1.9.1
+## explicit; go 1.15
+github.com/spf13/cobra
+# github.com/spf13/pflag v1.0.6
+## explicit; go 1.12
+github.com/spf13/pflag
+# github.com/stretchr/testify v1.11.1
+## explicit; go 1.17
+# github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e
+## explicit; go 1.19
+github.com/xo/terminfo
+# github.com/yosida95/uritemplate/v3 v3.0.2
+## explicit; go 1.14
+github.com/yosida95/uritemplate/v3
+# github.com/ysmood/fetchup v0.2.3
+## explicit; go 1.20
+github.com/ysmood/fetchup
+# github.com/ysmood/goob v0.4.0
+## explicit; go 1.15
+github.com/ysmood/goob
+# github.com/ysmood/got v0.40.0
+## explicit; go 1.21
+github.com/ysmood/got/lib/lcs
+# github.com/ysmood/gson v0.7.3
+## explicit; go 1.15
+github.com/ysmood/gson
+# github.com/ysmood/leakless v0.9.0
+## explicit; go 1.15
+github.com/ysmood/leakless
+github.com/ysmood/leakless/pkg/shared
+github.com/ysmood/leakless/pkg/utils
+# golang.org/x/exp v0.0.0-20260212183809-81e46e3db34a
+## explicit; go 1.25.0
+# golang.org/x/net v0.50.0
+## explicit; go 1.24.0
+golang.org/x/net/html
+golang.org/x/net/html/atom
+golang.org/x/net/html/charset
+# golang.org/x/oauth2 v0.30.0
+## explicit; go 1.23.0
+golang.org/x/oauth2
+golang.org/x/oauth2/internal
+# golang.org/x/sys v0.41.0
+## explicit; go 1.24.0
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+# golang.org/x/text v0.34.0
+## explicit; go 1.24.0
+golang.org/x/text/encoding
+golang.org/x/text/encoding/charmap
+golang.org/x/text/encoding/htmlindex
+golang.org/x/text/encoding/internal
+golang.org/x/text/encoding/internal/identifier
+golang.org/x/text/encoding/japanese
+golang.org/x/text/encoding/korean
+golang.org/x/text/encoding/simplifiedchinese
+golang.org/x/text/encoding/traditionalchinese
+golang.org/x/text/encoding/unicode
+golang.org/x/text/internal/language
+golang.org/x/text/internal/language/compact
+golang.org/x/text/internal/tag
+golang.org/x/text/internal/utf8internal
+golang.org/x/text/language
+golang.org/x/text/runes
+golang.org/x/text/transform
+golang.org/x/text/unicode/norm
+# golang.org/x/tools v0.42.0
+## explicit; go 1.24.0
