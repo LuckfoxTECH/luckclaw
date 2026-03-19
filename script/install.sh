@@ -6,6 +6,35 @@ REPO="LuckfoxTECH/luckclaw"
 INSTALL_DIR="/usr/bin"
 LUCKCLAW_HOME="${LUCKCLAW_HOME:-$HOME/.luckclaw}"
 FORCE_VERSION=""
+USE_SUDO=false
+
+check_install_method() {
+    if [ "$(id -u)" = "0" ]; then
+        echo "Running as root, installing to /usr/bin"
+        USE_SUDO=false
+        INSTALL_DIR="/usr/bin"
+        return 0
+    fi
+    
+    if ! command -v sudo &> /dev/null; then
+        echo "Warning: sudo not found, will install to ~/.local/bin"
+        USE_SUDO=false
+        INSTALL_DIR="$HOME/.local/bin"
+        return 0
+    fi
+    
+    if sudo -n true 2>/dev/null; then
+        echo "sudo available, installing to /usr/bin"
+        USE_SUDO=true
+        INSTALL_DIR="/usr/bin"
+        return 0
+    else
+        echo "Warning: No sudo access, will install to ~/.local/bin"
+        USE_SUDO=false
+        INSTALL_DIR="$HOME/.local/bin"
+        return 0
+    fi
+}
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -51,7 +80,7 @@ detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64)   echo "x86_64" ;;
         aarch64|arm64)  echo "arm64" ;;
-        armv7)          echo "armv7" ;;
+        armv7|armv7l)   echo "armv7" ;;
         *)              echo "unsupported" ;;
     esac
 }
@@ -73,7 +102,7 @@ download_binary() {
 
     echo "Downloading luckclaw v${version} for ${os}-${arch}..."
 
-    if curl -sL --fail "$url" -o "/tmp/${filename}"; then
+    if curl -#L --fail "$url" -o "/tmp/${filename}"; then
         echo "Downloaded to /tmp/${filename}"
     else
         echo "Error: Failed to download from $url"
@@ -104,17 +133,31 @@ add_to_path() {
         return
     fi
 
-    if [[ ":$PATH:" == *":${bin_dir}:"* ]]; then
-        return
-    fi
-
     if [ "$bin_dir" = "/usr/bin" ]; then
         return
     fi
 
-    if [ -n "$ZSH_VERSION" ]; then
+    local current_shell=""
+    current_shell="$(ps -p $$ -o comm= 2>/dev/null)"
+
+    if [ -z "$current_shell" ]; then
+        if [ -n "$ZSH_VERSION" ]; then
+            current_shell="zsh"
+        elif [ -n "$BASH_VERSION" ]; then
+            current_shell="bash"
+        fi
+    fi
+
+    case ":$PATH:" in
+        *:${bin_dir}:*)
+            echo "${bin_dir} already in PATH"
+            return
+            ;;
+    esac
+
+    if [ "$current_shell" = "zsh" ]; then
         shell_rc="$HOME/.zshrc"
-    elif [ -n "$BASH_VERSION" ]; then
+    elif [ "$current_shell" = "bash" ]; then
         if [ -f "$HOME/.bashrc" ]; then
             shell_rc="$HOME/.bashrc"
         elif [ -f "$HOME/.bash_profile" ]; then
@@ -123,13 +166,20 @@ add_to_path() {
     fi
 
     if [ -n "$shell_rc" ]; then
-        if ! grep -q "${bin_dir}" "$shell_rc" 2>/dev/null; then
+        if grep -q "${bin_dir}" "$shell_rc" 2>/dev/null; then
+            echo "${bin_dir} already configured in $shell_rc, but not in current PATH"
+            echo "Please run: source $shell_rc"
+        else
             echo "" >> "$shell_rc"
             echo "# Added by luckclaw installer" >> "$shell_rc"
             echo "export PATH=\"${bin_dir}:\$PATH\"" >> "$shell_rc"
             echo "Added ${bin_dir} to PATH in $shell_rc"
             echo "Please run: source $shell_rc"
         fi
+    else
+        echo "Warning: Unable to detect shell config file"
+        echo "Please add the following line to your shell config file:"
+        echo "  export PATH=\"${bin_dir}:\$PATH\""
     fi
 }
 
@@ -162,15 +212,26 @@ main() {
     download_binary "$version" "$os" "$arch"
 
     local filename="luckclaw-${os}-${arch}"
+    
+    check_install_method
 
     if [ ! -d "$INSTALL_DIR" ]; then
         echo "Creating install directory: $INSTALL_DIR"
-        sudo mkdir -p "$INSTALL_DIR"
+        if [ "$USE_SUDO" = true ]; then
+            sudo mkdir -p "$INSTALL_DIR" || { echo "Error: Failed to create $INSTALL_DIR"; exit 1; }
+        else
+            mkdir -p "$INSTALL_DIR" || { echo "Error: Failed to create $INSTALL_DIR"; exit 1; }
+        fi
     fi
 
     echo "Installing to $INSTALL_DIR..."
-    sudo mv "/tmp/${filename}" "$INSTALL_DIR/luckclaw"
-    sudo chmod +x "$INSTALL_DIR/luckclaw"
+    if [ "$USE_SUDO" = true ]; then
+        sudo mv "/tmp/${filename}" "$INSTALL_DIR/luckclaw" || { echo "Error: Failed to move binary"; exit 1; }
+        sudo chmod +x "$INSTALL_DIR/luckclaw" || { echo "Error: Failed to set permissions"; exit 1; }
+    else
+        mv "/tmp/${filename}" "$INSTALL_DIR/luckclaw" || { echo "Error: Failed to move binary"; exit 1; }
+        chmod +x "$INSTALL_DIR/luckclaw" || { echo "Error: Failed to set permissions"; exit 1; }
+    fi
 
     echo "Installed luckclaw to $INSTALL_DIR/luckclaw"
     echo ""
