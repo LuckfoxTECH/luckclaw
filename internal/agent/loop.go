@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -123,6 +124,9 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 		})
 	}
 	registry.Register(&tools.ToolSearchTool{Registry: registry})
+	registry.Register(&tools.CLIUsageFinderTool{
+		HTTPClient: &http.Client{},
+	})
 	registry.Register(&tools.WebFetchTool{
 		MaxChars:        50000,
 		ProxyConfig:     cfg.Tools.Web,
@@ -467,6 +471,9 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	if a.Config.Agents.Defaults.ResourceConstrained {
 		sysPrompt = sysPrompt + "\n\n## Resource-Constrained Environment\nYou are running in a resource-constrained environment (e.g., embedded device, low-storage system). Do NOT automatically download or install software packages. Instead, provide clear instructions for the user to install manually. For ClawHub skills, suggest: `luckclaw clawhub install <slug>`. For system packages, provide apt/yum/brew commands but do not execute them."
 	}
+
+	// Tool Priority: CLI usage questions
+	sysPrompt = sysPrompt + "\n\n## Tool Priority: CLI Usage\nFor any questions related to CLI tool usage, flags, arguments, or subcommands, you MUST use the `cli_usage_finder` tool FIRST. It searches actual source code to provide the most accurate usage information. Avoid using `web_search` or general knowledge for CLI usage unless `cli_usage_finder` fails to provide sufficient details."
 
 	for _, n := range a.Tools.ToolNames() {
 		if strings.HasPrefix(n, "mcp_") {

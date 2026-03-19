@@ -64,15 +64,16 @@ type WebSearchTool struct {
 
 func (t *WebSearchTool) Name() string { return "web_search" }
 func (t *WebSearchTool) Description() string {
-	return "Search the web for up-to-date information. Supports Brave, Tavily, DuckDuckGo, Perplexity, SearXNG."
+	return "Search the web for up-to-date information. Supports Brave, Tavily, DuckDuckGo, Perplexity, SearXNG. NOTE: For CLI usage, flags, and arguments, always use cli_usage_finder first as it provides more accurate source-based information."
 }
+
 func (t *WebSearchTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"query": map[string]any{
 				"type":        "string",
-				"description": "Search query",
+				"description": "Search query. For CLI usage questions, include the CLI name and context.",
 			},
 			"max_results": map[string]any{
 				"type":        "integer",
