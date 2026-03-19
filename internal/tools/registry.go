@@ -188,6 +188,24 @@ func (r *Registry) DefinitionsFiltered(allowed, disabled []string) []openaiapi.T
 }
 
 func (r *Registry) ExecuteJSON(ctx context.Context, name string, argsJSON string) (string, error) {
+	if RunModeFromContext(ctx) == RunModePlan {
+		allowed := map[string]bool{
+			"read_file":        true,
+			"list_dir":         true,
+			"tool_search":      true,
+			"web_search":       true,
+			"web_fetch":        true,
+			"cli_usage_finder": true,
+			"security_audit":   true,
+			"clawhub_search":   true,
+			"search":           true,
+		}
+		if !allowed[name] {
+			msg := fmt.Sprintf("Error: tool %q is disabled in plan mode (read-only)", name)
+			return msg + errorHint, fmt.Errorf("%s", strings.TrimPrefix(msg, "Error: "))
+		}
+	}
+
 	// Sub-agent tool policy: reject if tool is disabled or not in allowed list
 	if meta := SubAgentFromContext(ctx); meta != nil {
 		for _, d := range meta.Disabled {

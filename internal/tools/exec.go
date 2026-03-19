@@ -54,14 +54,30 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]any) (string, er
 		return "", fmt.Errorf("blocked potentially dangerous command")
 	}
 
-	if err := t.guardWorkspace(command, workingDir); err != nil {
-		return "", err
-	}
-
 	timeout := 60 * time.Second
 	if t.TimeoutSeconds > 0 {
 		timeout = time.Duration(t.TimeoutSeconds) * time.Second
 	}
+
+	if term := TerminalFromContext(ctx); term != nil && strings.EqualFold(strings.TrimSpace(term.Type), "ssh") && strings.TrimSpace(term.SSH.Host) != "" {
+		if strings.HasPrefix(command, "ssh ") || strings.HasPrefix(command, "scp ") {
+			return "", fmt.Errorf("active terminal is set; do not run ssh/scp inside exec. Run the remote command directly")
+		}
+		remoteCmd := command
+		if strings.TrimSpace(workingDir) != "" {
+			remoteCmd = "cd " + shQuote(strings.TrimSpace(workingDir)) + " && " + remoteCmd
+		}
+		out, err := RunSSHCommand(ctx, term.SSH, remoteCmd, timeout)
+		if err != nil {
+			return out, err
+		}
+		return out, nil
+	}
+
+	if err := t.guardWorkspace(command, workingDir); err != nil {
+		return "", err
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -120,6 +136,13 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]any) (string, er
 		return strings.TrimSpace(full), err
 	}
 	return full, nil
+}
+
+func shQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func (t *ExecTool) resolveWorkingDir(arg string) (string, error) {

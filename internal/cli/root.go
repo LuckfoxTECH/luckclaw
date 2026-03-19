@@ -56,6 +56,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newCronCmd())
 	root.AddCommand(newChannelsCmd())
 	root.AddCommand(newHeartbeatCmd())
+	root.AddCommand(newTerminalCmd())
 	root.AddCommand(newSkillsCmd())
 	root.AddCommand(newClawhubCmd())
 

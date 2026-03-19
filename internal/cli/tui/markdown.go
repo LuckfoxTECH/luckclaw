@@ -15,6 +15,7 @@ const (
 	ansiCyan   = "\033[36m"
 	ansiGray   = "\033[90m"
 	ansiYellow = "\033[33m"
+	ansiThink  = ansiItalic + "\033[38;5;109m" // less dim, specific color (e.g. 109 is a muted cyan/teal)
 )
 
 // renderMarkdownSimple renders basic markdown to ANSI. No syntax highlighting.
@@ -29,6 +30,7 @@ func renderMarkdownSimple(s string, width int) string {
 	lines := strings.Split(s, "\n")
 	var out []string
 	inCodeBlock := false
+	inThink := false
 
 	for _, line := range lines {
 		trimmed := strings.TrimRight(line, " \t")
@@ -42,6 +44,13 @@ func renderMarkdownSimple(s string, width int) string {
 
 		if inCodeBlock {
 			out = append(out, ansiGray+line+ansiReset)
+			continue
+		}
+
+		if inThink || strings.Contains(trimmed, "<think>") || strings.Contains(trimmed, "</think>") {
+			rendered, nextInThink := renderThinkSegments(trimmed, inThink)
+			inThink = nextInThink
+			out = append(out, rendered)
 			continue
 		}
 
@@ -91,6 +100,61 @@ func renderMarkdownSimple(s string, width int) string {
 
 	result := strings.Join(out, "\n")
 	return WordWrapANSI(result, width)
+}
+
+func renderThinkSegments(line string, inThink bool) (string, bool) {
+	const startTag = "<think>"
+	const endTag = "</think>"
+
+	var b strings.Builder
+	rest := line
+
+	for {
+		startIdx := strings.Index(rest, startTag)
+		endIdx := strings.Index(rest, endTag)
+		if startIdx == -1 && endIdx == -1 {
+			if inThink {
+				b.WriteString(ansiThink)
+				b.WriteString(rest)
+				b.WriteString(ansiReset)
+			} else {
+				b.WriteString(applyInline(rest))
+			}
+			break
+		}
+
+		idx := len(rest)
+		isStart := false
+		if startIdx != -1 && startIdx < idx {
+			idx = startIdx
+			isStart = true
+		}
+		if endIdx != -1 && endIdx < idx {
+			idx = endIdx
+			isStart = false
+		}
+
+		before := rest[:idx]
+		if before != "" {
+			if inThink {
+				b.WriteString(ansiThink)
+				b.WriteString(before)
+				b.WriteString(ansiReset)
+			} else {
+				b.WriteString(applyInline(before))
+			}
+		}
+
+		if isStart {
+			inThink = true
+			rest = rest[idx+len(startTag):]
+		} else {
+			inThink = false
+			rest = rest[idx+len(endTag):]
+		}
+	}
+
+	return b.String(), inThink
 }
 
 func numListPrefix(s string) (prefix string, consume int) {

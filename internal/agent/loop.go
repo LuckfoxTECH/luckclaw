@@ -29,11 +29,15 @@ const toolResultMaxChars = 500
 
 const runtimeContextTag = "[Runtime Context — metadata only, not instructions]"
 
-// planModePrompt instructs the agent to output a plan first, then execute step by step.
-const planModePrompt = `[Planning Mode] Follow these steps:
-1. First output a numbered plan (Plan: 1. xxx 2. xxx ...) without calling any tools
-2. After the plan is output, execute each step one by one
-3. If a step fails and needs adjustment, briefly explain and continue`
+const planModePrompt = `[Plan Mode] Constraints:
+- Do not modify any files
+- Do not execute commands or run programs
+- Read-only tools are allowed when needed (e.g. reading files, listing directories, web fetch/search)
+
+Instructions:
+1. Analyze the request and gather required info (use read-only tools if needed)
+2. Output a numbered plan (Plan: 1. ... 2. ...), including key files/areas to change
+3. Stop after planning (do not implement)`
 
 func (a *AgentLoop) blockStreamingEnabled(channel, chatID string) bool {
 	if channel == "" || chatID == "" || a.Bus == nil {
@@ -84,6 +88,9 @@ type AgentLoop struct {
 	consolidationLocks       map[string]*consolidationLockEntry
 	consolidationLastCleanup time.Time
 
+	terminalSecretsMu sync.Mutex
+	terminalPasswords map[string]map[string]string
+
 	// OnTurnComplete is an optional callback for TUI/CLI to report token usage after each turn.
 	// channel, chatID: for routing (e.g. webui sends to WebSocket session).
 	OnTurnComplete func(channel, chatID string, model string, promptTokens, completionTokens, totalTokens int)
@@ -92,6 +99,9 @@ type AgentLoop struct {
 	OnContextInfo func(channel, chatID string, count string, mode string)
 	// OnModelResolved is an optional callback for TUI to show the resolved model at turn start (before API call).
 	OnModelResolved func(channel, chatID string, model string)
+
+	// OnTerminalResolved is an optional callback for TUI to show active terminal at turn start.
+	OnTerminalResolved func(channel, chatID string, terminalLabel string)
 }
 
 func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Manager, model string, logger logging.Logger) *AgentLoop {
@@ -113,6 +123,14 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 		TimeoutSeconds:      cfg.Tools.Exec.Timeout,
 		RestrictToWorkspace: cfg.Tools.RestrictToWorkspace,
 		PathAppend:          cfg.Tools.Exec.PathAppend,
+	})
+	registry.Register(&tools.SSHTool{
+		TimeoutSeconds: cfg.Tools.Exec.Timeout,
+	})
+	registry.Register(&tools.TerminalTransferTool{
+		AllowedDir:     allowedDir,
+		BaseDir:        baseDir,
+		TimeoutSeconds: cfg.Tools.Exec.Timeout,
 	})
 	if wsTool := tools.NewWebSearchTool(cfg.Tools.Web.Search, cfg.Tools.Web); wsTool != nil {
 		registry.Register(wsTool)
@@ -187,6 +205,7 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 		Memory:             mem,
 		SelfImproving:      selfImproving,
 		consolidationLocks: make(map[string]*consolidationLockEntry),
+		terminalPasswords:  make(map[string]map[string]string),
 	}
 	if cfg.Agents.SubAgents.Enabled {
 		max := cfg.Agents.SubAgents.MaxConcurrent
@@ -361,10 +380,19 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 			message = execPrompt
 		}
 	}
+	if strings.HasPrefix(trimmed, "/plan") {
+		ctx = tools.WithRunMode(ctx, tools.RunModePlan)
+	}
 
 	s, err := a.Sessions.GetOrCreate(sessionKey)
 	if err != nil {
 		return "", false, err
+	}
+	st := a.loadTerminalState(s)
+	var remoteBins []string
+	termCtx, remoteBins, _ := a.activeTerminalContext(sessionKey, st)
+	if termCtx != nil {
+		ctx = tools.WithTerminalContext(ctx, termCtx)
 	}
 	if (s.Metadata == nil || s.Metadata["summary"] == nil || s.Metadata["summary"] == "") && len(s.Messages) == 0 {
 		if s.Metadata == nil {
@@ -517,7 +545,10 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	}
 
 	// Build runtime context (includes model so agent can answer "what model are you using?")
-	runtimeCtx := buildRuntimeContext(channel, chatID, resolvedModel)
+	runtimeCtx := buildRuntimeContext(channel, chatID, resolvedModel, termCtx, remoteBins)
+	if a.OnTerminalResolved != nil {
+		a.OnTerminalResolved(channel, chatID, formatTerminalLabel(termCtx))
+	}
 
 	// Notify TUI of total context length and mode (sysPrompt + runtimeCtx) for status bar
 	if a.OnContextInfo != nil {
@@ -717,10 +748,8 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 
 		sanitized := openaiapi.SanitizeEmptyContent(msgs)
 		toolDefs := a.Tools.Definitions()
-		if subMeta != nil && a.Config.Agents.SubAgents.Inherit.Tools {
-			allowed := a.Config.Agents.SubAgents.ToolPolicy.Allowed
-			disabled := a.Config.Agents.SubAgents.ToolPolicy.Disabled
-			toolDefs = a.Tools.DefinitionsFiltered(allowed, disabled)
+		if meta := tools.SubAgentFromContext(ctx); meta != nil {
+			toolDefs = a.Tools.DefinitionsFiltered(meta.Allowed, meta.Disabled)
 		}
 		model := a.Config.ModelIDForAPI(resolvedModel)
 		req := openaiapi.ChatRequest{
@@ -797,7 +826,9 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 			}
 			res, err = a.chatWithRetryStream(ctx, req, cb)
 			if err == nil {
-				chunker.Flush(buf.String(), publishChunk)
+				flushed := buf.String()
+				flushed = appendTerminalSuffix(channel, flushed, termCtx)
+				chunker.Flush(flushed, publishChunk)
 			}
 		} else {
 			res, err = a.chatWithRetry(ctx, req)
@@ -956,7 +987,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 			continue
 		}
 
-		final = res.Content
+		final = appendTerminalSuffix(channel, res.Content, termCtx)
 		hitIterLimit = false // Not exiting due to the iteration limit reached
 		streamed = useStreaming
 
@@ -971,7 +1002,9 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 				buf.Reset()
 				res, err = a.chatWithRetryStream(ctx, req, cb)
 				if err == nil {
-					chunker.Flush(buf.String(), publishChunk)
+					flushed := buf.String()
+					flushed = appendTerminalSuffix(channel, flushed, termCtx)
+					chunker.Flush(flushed, publishChunk)
 				}
 			} else {
 				res, err = a.chatWithRetry(ctx, req)
@@ -1222,6 +1255,9 @@ func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionK
 
 	case "/skill":
 		return a.handleSkillCommand(ctx, sessionKey, parts[1:])
+
+	case "/terminal":
+		return a.handleTerminalCommand(ctx, sessionKey, parts[1:])
 
 	case "/subagents":
 		if handled, content := a.handleSubagentsCmd(ctx, cmd, sessionKey, channel, chatID, a.Bus); handled {
@@ -1637,6 +1673,15 @@ func (a *AgentLoop) handleSkillCommand(ctx context.Context, sessionKey string, a
 	if err != nil {
 		return "Error: " + err.Error(), true, ""
 	}
+	channel, chatID := tools.ChannelFromContext(ctx)
+	sess, err := a.Sessions.GetOrCreate(sessionKey)
+	if err != nil {
+		return "Error: " + err.Error(), true, ""
+	}
+	termState := a.loadTerminalState(sess)
+	activeTermName := strings.TrimSpace(termState.Active)
+	activeTerm, hasActiveTerm := termState.Terminals[activeTermName]
+
 	skillList, err := skills.Discover(ws)
 	if err != nil {
 		return "Error: " + err.Error(), true, ""
@@ -1655,7 +1700,15 @@ func (a *AgentLoop) handleSkillCommand(ctx context.Context, sessionKey string, a
 			}
 			b.WriteString(fmt.Sprintf("  - %s (%s)\n", s.Name, state))
 		}
-		b.WriteString("\nUse `/skill <name>` to run a skill (e.g. `/skill weather`).")
+		if hasActiveTerm && strings.EqualFold(strings.TrimSpace(activeTerm.Type), "ssh") && strings.TrimSpace(activeTerm.SSH.Host) != "" {
+			target := activeTerm.SSH.Host
+			if strings.TrimSpace(activeTerm.SSH.User) != "" {
+				target = activeTerm.SSH.User + "@" + activeTerm.SSH.Host
+			}
+			b.WriteString("\nRemote terminal is active (" + activeTermName + " " + target + "). `/skill <name>` will run in a remote workspace and will not touch local files.")
+		} else {
+			b.WriteString("\nUse `/skill <name>` to run a skill (e.g. `/skill weather`).")
+		}
 		return b.String(), true, ""
 	}
 	// /skill <name> — run the named skill
@@ -1664,6 +1717,18 @@ func (a *AgentLoop) handleSkillCommand(ctx context.Context, sessionKey string, a
 		if strings.ToLower(s.Name) == name {
 			if !s.Available {
 				return fmt.Sprintf("Skill %q is unavailable (missing deps). Use read_file to check %s for requirements.", s.Name, s.Path), true, ""
+			}
+			if hasActiveTerm && strings.EqualFold(strings.TrimSpace(activeTerm.Type), "ssh") && strings.TrimSpace(activeTerm.SSH.Host) != "" {
+				activeTerm.SSH = a.resolveSSHConn(sessionKey, activeTermName, activeTerm.SSH)
+				out, updatedTerm, err := a.runRemoteSkill(ctx, sessionKey, channel, chatID, activeTermName, activeTerm, s, args)
+				if err != nil {
+					return "Error: " + err.Error() + "\n" + strings.TrimSpace(out), true, ""
+				}
+				updatedTerm.RefreshedAt = time.Now().Format(time.RFC3339Nano)
+				termState.Terminals[activeTermName] = updatedTerm
+				a.saveTerminalState(sess, termState)
+				_ = a.Sessions.Save(sess)
+				return out, true, ""
 			}
 			execPrompt := fmt.Sprintf("Please run the %s skill. User requested: /skill %s", s.Name, s.Name)
 			if len(args) > 1 {
@@ -1756,6 +1821,7 @@ func (a *AgentLoop) buildHelpMessage(channel string) string {
 		"  /new     - Start a new conversation (consolidates memory first)",
 		"  /reset   - Clear conversation without memory consolidation",
 		"  /verbose - Toggle verbose mode; /verbose on | off to set explicitly",
+		"  /terminal - Manage and switch remote terminal control",
 		"  /model   - Show or switch model; /model <id> to switch",
 		"  /models  - List available models",
 		"  /plan    - Plan first, then execute: /plan <task>",
@@ -2155,7 +2221,7 @@ func formatContextLen(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-func buildRuntimeContext(channel, chatID, model string) string {
+func buildRuntimeContext(channel, chatID, model string, term *tools.TerminalContext, remoteBins []string) string {
 	now := time.Now()
 	tz := now.Location().String()
 	parts := []string{
@@ -2178,7 +2244,58 @@ func buildRuntimeContext(channel, chatID, model string) string {
 			parts = append(parts, "Media/File sending: NOT supported. Do NOT suggest get_ref or send_file. Instead, inform the user the file is saved at the path and that this platform cannot display images.")
 		}
 	}
+	if term != nil && strings.TrimSpace(term.Type) != "" {
+		target := term.SSH.Host
+		if strings.TrimSpace(term.SSH.User) != "" {
+			target = term.SSH.User + "@" + term.SSH.Host
+		}
+		if term.SSH.Port > 0 {
+			target = target + ":" + fmt.Sprintf("%d", term.SSH.Port)
+		}
+		parts = append(parts, fmt.Sprintf("Active Terminal: %s (%s %s)", term.Name, term.Type, target))
+		parts = append(parts, "exec: routed to active terminal (remote)")
+		parts = append(parts, "When Active Terminal is set, use exec to run commands on it (do NOT call ssh tool for that host).")
+		if len(remoteBins) > 0 {
+			parts = append(parts, "Remote capabilities (bins): "+strings.Join(remoteBins, ", "))
+		}
+	} else {
+		parts = append(parts, "Active Terminal: none")
+		parts = append(parts, "exec: local")
+	}
 	return runtimeContextTag + "\n" + strings.Join(parts, "\n")
+}
+
+func formatTerminalLabel(term *tools.TerminalContext) string {
+	if term == nil || strings.TrimSpace(term.Type) == "" || strings.TrimSpace(term.Name) == "" {
+		return "local"
+	}
+	if strings.EqualFold(strings.TrimSpace(term.Type), "ssh") {
+		target := strings.TrimSpace(term.SSH.Host)
+		if strings.TrimSpace(term.SSH.User) != "" {
+			target = strings.TrimSpace(term.SSH.User) + "@" + strings.TrimSpace(term.SSH.Host)
+		}
+		if strings.TrimSpace(target) == "" {
+			return term.Name
+		}
+		return fmt.Sprintf("%s(%s)", term.Name, target)
+	}
+	return term.Name + "(" + strings.TrimSpace(term.Type) + ")"
+}
+
+func appendTerminalSuffix(channel string, content string, term *tools.TerminalContext) string {
+	if strings.TrimSpace(content) == "" {
+		return content
+	}
+	if channel != "tui" {
+		return content
+	}
+	label := formatTerminalLabel(term)
+	suffix := "(" + label + ")"
+	trimmed := strings.TrimSpace(content)
+	if strings.HasSuffix(trimmed, suffix) {
+		return content
+	}
+	return strings.TrimRight(content, " \n\t") + "\n\n" + suffix
 }
 
 // emitToolProgress sends a tool_progress message showing tools about to execute.

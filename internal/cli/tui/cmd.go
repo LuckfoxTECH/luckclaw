@@ -14,6 +14,7 @@ import (
 	"luckclaw/internal/paths"
 	"luckclaw/internal/providers/openaiapi"
 	sessionpkg "luckclaw/internal/session"
+	"luckclaw/internal/tools"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -34,6 +35,8 @@ type tuiStatus struct {
 	Connected bool
 	// Current model ID
 	Model string
+	// Current terminal label (local or name(user@host))
+	Terminal string
 	// Token usage from last completed turn
 	PromptTokens     int
 	CompletionTokens int
@@ -68,6 +71,15 @@ func (s *tuiStatus) SetModel(m string) {
 	}
 }
 
+func (s *tuiStatus) SetTerminal(v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(v) == "" {
+		return
+	}
+	s.Terminal = v
+}
+
 func (s *tuiStatus) SetTokens(prompt, completion, total int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -98,7 +110,7 @@ func (s *tuiStatus) SetVersion(v string) {
 	s.Version = v
 }
 
-func (s *tuiStatus) Get() (status string, runningDur time.Duration, connected bool, model string, promptTok, completionTok, totalTok, ctxWindow int, ctxSources, ctxMode string, version string) {
+func (s *tuiStatus) Get() (status string, runningDur time.Duration, connected bool, model string, terminal string, promptTok, completionTok, totalTok, ctxWindow int, ctxSources, ctxMode string, version string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	status = s.Status
@@ -107,6 +119,7 @@ func (s *tuiStatus) Get() (status string, runningDur time.Duration, connected bo
 	}
 	connected = s.Connected
 	model = s.Model
+	terminal = s.Terminal
 	promptTok = s.PromptTokens
 	completionTok = s.CompletionTokens
 	totalTok = s.TotalTokens
@@ -142,9 +155,10 @@ func getSlashCommands(cfg config.Config) []slashCommand {
 		{"/new", "Start new conversation (consolidates memory)"},
 		{"/reset", "Clear conversation without memory consolidation"},
 		{"/verbose", "Toggle verbose mode"},
+		{"/terminal", "Manage and switch remote terminal control"},
 		{"/model", "Show or switch model"},
 		{"/models", "List available models"},
-		{"/plan", "Plan first then execute: /plan <task>"},
+		{"/plan", "Planning mode: /plan <task> | /plan on | /plan off"},
 		{"/skill", "List skills; /skill <name> to run a skill"},
 		{"/simple", "Toggle simple mode (compact context, saves tokens)"},
 		{"/summary", "Summarize current conversation"},
@@ -247,6 +261,9 @@ func NewCmd() *cobra.Command {
 			loop.OnModelResolved = func(channel, chatID string, m string) {
 				status.SetModel(m)
 			}
+			loop.OnTerminalResolved = func(channel, chatID string, term string) {
+				status.SetTerminal(term)
+			}
 			loop.OnTurnComplete = func(channel, chatID string, m string, prompt, completion, total int) {
 				status.SetModel(m)
 				status.SetTokens(prompt, completion, total)
@@ -266,6 +283,8 @@ func NewCmd() *cobra.Command {
 				session:       session,
 				messages:      []chatMessage{},
 				input:         "",
+				runMode:       tools.RunModeBuild,
+				historyIndex:  -1,
 				slashCommands: getSlashCommands(cfg),
 				thinkingText:  thinkingText,
 				renamingIdx:   -1,
@@ -299,6 +318,10 @@ type tuiProgram struct {
 	messages      []chatMessage
 	input         string
 	inputPos      int // Cursor position (rune count): 0=start, len=end
+	runMode       tools.RunMode
+	inputHistory  []string
+	historyIndex  int
+	historyDraft  string
 	slashCommands []slashCommand
 	// Completion state: when input starts with /, show completions
 	completionIndex int // selected index in filtered list
@@ -344,6 +367,61 @@ func (p *tuiProgram) filteredCompletions() []slashCommand {
 	return filterSlashCompletions(p.input, p.slashCommands)
 }
 
+func (p *tuiProgram) resetHistoryBrowsing() {
+	p.historyIndex = -1
+	p.historyDraft = ""
+}
+
+func (p *tuiProgram) addInputHistory(s string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return
+	}
+	if n := len(p.inputHistory); n > 0 && p.inputHistory[n-1] == s {
+		return
+	}
+	p.inputHistory = append(p.inputHistory, s)
+	const maxHistory = 200
+	if len(p.inputHistory) > maxHistory {
+		p.inputHistory = p.inputHistory[len(p.inputHistory)-maxHistory:]
+	}
+}
+
+func (p *tuiProgram) historyUp() bool {
+	if len(p.inputHistory) == 0 {
+		return false
+	}
+	if p.historyIndex == -1 {
+		if strings.TrimSpace(p.input) != "" {
+			return false
+		}
+		p.historyDraft = p.input
+		p.historyIndex = len(p.inputHistory) - 1
+	} else if p.historyIndex > 0 {
+		p.historyIndex--
+	}
+	p.input = p.inputHistory[p.historyIndex]
+	p.inputPos = utf8.RuneCountInString(p.input)
+	return true
+}
+
+func (p *tuiProgram) historyDown() bool {
+	if p.historyIndex == -1 {
+		return false
+	}
+	if p.historyIndex < len(p.inputHistory)-1 {
+		p.historyIndex++
+		p.input = p.inputHistory[p.historyIndex]
+		p.inputPos = utf8.RuneCountInString(p.input)
+		return true
+	}
+	p.historyIndex = -1
+	p.input = p.historyDraft
+	p.inputPos = utf8.RuneCountInString(p.input)
+	p.historyDraft = ""
+	return true
+}
+
 // contentLineCount returns (totalLines, contentHeight) for scroll clamping.
 func (p *tuiProgram) contentLineCount() (int, int) {
 	contentHeight := p.height - 5 // TopBar(1) + Header(1) + Input(1) + Status(1) + Footer(1)
@@ -383,9 +461,8 @@ func (p *tuiProgram) buildContentString() string {
 	if width <= 0 {
 		width = 80
 	}
-	// User message: gray background with blue left border accent
+	// User message: left border accent
 	userBgStyle := lipgloss.NewStyle().
-		Background(lipgloss.Color("235")).
 		Padding(0, 1).
 		Border(lipgloss.Border{
 			Left: "┃",
@@ -405,7 +482,7 @@ func (p *tuiProgram) buildContentString() string {
 		}
 	}
 	content := strings.Join(contentBlocks, "\n\n")
-	st, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+	st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
 	isRunning := st == "running" || st == "thinking"
 	if isRunning {
 		if p.progressContent != "" {
@@ -521,12 +598,17 @@ func (p *tuiProgram) updateSessions(msg tea.Msg) (tea.Model, tea.Cmd) {
 				p.session = p.sessionList[p.sessionIdx].Key
 				p.messages = []chatMessage{}
 				p.scrollOffset = 0
+				p.resetHistoryBrowsing()
+				p.inputHistory = nil
 				// Load messages for new session
 				s, _ := p.loop.Sessions.GetOrCreate(p.session)
 				for _, msg := range s.Messages {
 					role, _ := msg["role"].(string)
 					content, _ := msg["content"].(string)
 					p.messages = append(p.messages, chatMessage{role: role, content: content})
+					if role == "user" {
+						p.addInputHistory(content)
+					}
 				}
 				p.showSessions = false
 				return p, nil
@@ -567,6 +649,14 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				p.completionIndex = (p.completionIndex + 1) % len(filtered)
 				return p, nil
 			}
+			st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+			if st != "running" && st != "thinking" {
+				if p.runMode == tools.RunModePlan {
+					p.runMode = tools.RunModeBuild
+				} else {
+					p.runMode = tools.RunModePlan
+				}
+			}
 			return p, nil
 		case "shift+tab":
 			if hasCompletions {
@@ -578,11 +668,17 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return p, nil
 		case "up":
+			if p.historyIndex != -1 && p.historyUp() {
+				return p, nil
+			}
 			if hasCompletions {
 				p.completionIndex--
 				if p.completionIndex < 0 {
 					p.completionIndex = len(filtered) - 1
 				}
+				return p, nil
+			}
+			if p.historyUp() {
 				return p, nil
 			}
 			// Scroll content up when not in completions
@@ -591,8 +687,14 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return p, nil
 		case "down":
+			if p.historyIndex != -1 && p.historyDown() {
+				return p, nil
+			}
 			if hasCompletions {
 				p.completionIndex = (p.completionIndex + 1) % len(filtered)
+				return p, nil
+			}
+			if p.historyDown() {
 				return p, nil
 			}
 			// Scroll content down when not in completions
@@ -622,11 +724,13 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return p, nil
 		case "enter":
+			p.resetHistoryBrowsing()
 			if hasCompletions {
 				sel := filtered[p.completionIndex]
 				inputTrim := strings.TrimSpace(p.input)
 				// If input matches selected completion, send; otherwise apply completion
 				if inputTrim == sel.Name {
+					p.addInputHistory(inputTrim)
 					p.input = ""
 					p.inputPos = 0
 					p.completionIndex = 0
@@ -641,6 +745,33 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if p.input != "" {
 				input := strings.TrimSpace(p.input)
+				if input == "/plan on" {
+					st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+					if st != "running" && st != "thinking" {
+						p.runMode = tools.RunModePlan
+						p.messages = append(p.messages, chatMessage{role: "assistant", content: "Switched to plan mode."})
+					} else {
+						p.messages = append(p.messages, chatMessage{role: "assistant", content: "Cannot switch mode while running."})
+					}
+					p.input = ""
+					p.inputPos = 0
+					p.completionIndex = 0
+					return p, nil
+				}
+				if input == "/plan off" {
+					st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+					if st != "running" && st != "thinking" {
+						p.runMode = tools.RunModeBuild
+						p.messages = append(p.messages, chatMessage{role: "assistant", content: "Switched to build mode."})
+					} else {
+						p.messages = append(p.messages, chatMessage{role: "assistant", content: "Cannot switch mode while running."})
+					}
+					p.input = ""
+					p.inputPos = 0
+					p.completionIndex = 0
+					return p, nil
+				}
+				p.addInputHistory(input)
 				p.input = ""
 				p.inputPos = 0
 				p.completionIndex = 0
@@ -651,22 +782,27 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return p, nil
 		case "left":
+			p.resetHistoryBrowsing()
 			if p.inputPos > 0 {
 				p.inputPos--
 			}
 			return p, nil
 		case "right":
+			p.resetHistoryBrowsing()
 			if p.inputPos < utf8.RuneCountInString(p.input) {
 				p.inputPos++
 			}
 			return p, nil
 		case "home", "ctrl+a":
+			p.resetHistoryBrowsing()
 			p.inputPos = 0
 			return p, nil
 		case "end", "ctrl+e":
+			p.resetHistoryBrowsing()
 			p.inputPos = utf8.RuneCountInString(p.input)
 			return p, nil
 		case "backspace":
+			p.resetHistoryBrowsing()
 			if p.inputPos > 0 {
 				bytePos := runePosToByteOffset(p.input, p.inputPos-1)
 				_, size := utf8.DecodeRuneInString(p.input[bytePos:])
@@ -681,6 +817,7 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return p, nil
 		case "ctrl+w":
+			p.resetHistoryBrowsing()
 			// Delete the word before the cursor
 			if p.inputPos > 0 {
 				runes := []rune(p.input)
@@ -697,6 +834,7 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return p, nil
 		default:
 			if len(m.Runes) > 0 {
+				p.resetHistoryBrowsing()
 				bytePos := runePosToByteOffset(p.input, p.inputPos)
 				p.input = p.input[:bytePos] + string(m.Runes) + p.input[bytePos:]
 				p.inputPos += utf8.RuneCountInString(string(m.Runes))
@@ -718,7 +856,7 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if m.Content != "" {
 			// Spawn callback (including **Status:** and runId) always creates a new message to avoid being overwritten by agentDoneMsg after being merged with the parent agent's streaming content.
 			isSpawnResult := strings.Contains(m.Content, "**Status:**") && strings.Contains(m.Content, "runId")
-			st, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+			st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
 			isRunning := st == "running" || st == "thinking"
 			appendToLast := !isSpawnResult && isRunning && len(p.messages) > 0 && p.messages[len(p.messages)-1].role == "assistant"
 			if appendToLast {
@@ -735,13 +873,13 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		p.progressContent = ""
 		return p, nil
 	case tickMsg:
-		st, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+		st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
 		if st == "running" || st == "thinking" {
 			return p, tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg{} })
 		}
 		return p, nil
 	case animTickMsg:
-		st, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
+		st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
 		if st == "running" || st == "thinking" {
 			p.animFrame = (p.animFrame + 1) % 4
 			return p, tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg { return animTickMsg{} })
@@ -780,7 +918,15 @@ func (p *tuiProgram) runAgentAsync(input string) tea.Cmd {
 			channel = p.session[:idx]
 			chatID = p.session[idx+1:]
 		}
-		out, streamed, err := p.loop.ProcessDirectWithContext(context.Background(), input, p.session, channel, chatID, nil)
+		ctx := context.Background()
+		trimmed := strings.TrimSpace(input)
+		if p.runMode == tools.RunModePlan {
+			ctx = tools.WithRunMode(ctx, tools.RunModePlan)
+			if trimmed != "" && !strings.HasPrefix(trimmed, "/") {
+				input = "/plan " + trimmed
+			}
+		}
+		out, streamed, err := p.loop.ProcessDirectWithContext(ctx, input, p.session, channel, chatID, nil)
 		return agentDoneMsg{out: out, err: err, streamed: streamed}
 	}
 }
@@ -832,7 +978,7 @@ func (p *tuiProgram) viewSessions() string {
 		return ""
 	}
 
-	_, _, _, _, _, _, _, _, _, _, version := p.status.Get()
+	_, _, _, _, _, _, _, _, _, _, _, version := p.status.Get()
 	topBarText := fmt.Sprintf("🍀 luckclaw v%s | Sessions", version)
 	topBarStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("252")).
@@ -910,10 +1056,14 @@ func (p *tuiProgram) View() string {
 		return ""
 	}
 
-	status, runningDur, _, model, _, _, _, _, ctxSources, ctxMode, version := p.status.Get()
+	status, runningDur, _, model, terminal, _, _, _, _, ctxSources, ctxMode, version := p.status.Get()
 	isRunning := status == "running" || status == "thinking"
 	isStop := status == "stop"
 
+	termPart := "local"
+	if strings.TrimSpace(terminal) != "" {
+		termPart = strings.TrimSpace(terminal)
+	}
 	topBarText := fmt.Sprintf("🍀 luckclaw v%s", version)
 	topBarStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("252")).
@@ -933,7 +1083,7 @@ func (p *tuiProgram) View() string {
 		ctxPart = fmt.Sprintf(" ctx: %s%s", ctxSources, modeSuffix)
 	}
 
-	headerLeft := fmt.Sprintf("# %s", p.session)
+	headerLeft := fmt.Sprintf("# session: %s | term: %s", p.session, termPart)
 	// headerRight := fmt.Sprintf("tokens: %s%s", tokenStr, ctxPart)
 	headerRight := fmt.Sprintf("%s", ctxPart)
 
@@ -964,18 +1114,30 @@ func (p *tuiProgram) View() string {
 		anim := loadingFrames[p.animFrame%len(loadingFrames)]
 		statusStr = fmt.Sprintf("%s %s • %ds", status, anim, int(runningDur.Seconds()))
 	}
-	// Add model name to status bar
-	statusStr = fmt.Sprintf("%s | %s", statusStr, model)
+	// Add mode and model name to status bar (Mode first)
+	modePart := string(p.runMode)
+	if modePart == "" {
+		modePart = string(tools.RunModeBuild)
+	}
+	statusStr = fmt.Sprintf("%s | %s | %s", modePart, statusStr, model)
 
-	// Accent colors: running: teal; stop: amber; idle: blue
-	accentColor := lipgloss.Color("62") // blue (idle)
+	// Accent colors: running: green; stop: amber; idle: blue(Build) or cyan(Plan)
+	accentColor := lipgloss.Color("62") // blue (idle Build)
+	if p.runMode == tools.RunModePlan {
+		accentColor = lipgloss.Color("39") // cyan/blue (idle Plan)
+	}
+
 	if isRunning {
-		accentColor = lipgloss.Color("29") // teal
+		accentColor = lipgloss.Color("29")
 	} else if isStop {
 		accentColor = lipgloss.Color("166") // amber
 	}
 
-	statusBarStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(accentColor).Padding(0, 1)
+	// Remove padding to align exactly with the input border, but add a space at the start of the string for readability
+	statusBarStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).
+		Background(accentColor).
+		Padding(0, 1).
+		Width(w)
 	statusBar := statusBarStyle.Width(w).Render(statusStr)
 
 	// Input line: gray background with accent left border
@@ -988,12 +1150,11 @@ func (p *tuiProgram) View() string {
 		BorderForeground(accentColor).
 		Width(w)
 
-	bytePos := runePosToByteOffset(p.input, p.inputPos)
-	inputText := p.input[:bytePos] + "▌" + p.input[bytePos:]
-	inputLine := inputStyle.Render(inputText)
+	innerWidth := w - inputStyle.GetHorizontalFrameSize()
+	inputLine := inputStyle.Render(renderSingleLineInput(p.input, p.inputPos, innerWidth))
 
 	// Footer: help hint below status bar
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).Render("Type /help for commands.")
+	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).Render("Type /help for commands. | Tab: toggle plan/build")
 
 	// Content area (between header and input) - scrollable
 	content := p.buildContentString()
@@ -1062,7 +1223,6 @@ func (p *tuiProgram) View() string {
 	content += "\033[0m"
 
 	mainContent := lipgloss.NewStyle().
-		Background(lipgloss.Color("0")).
 		Width(w).
 		MaxWidth(w).
 		Height(contentAreaHeight).
@@ -1074,7 +1234,5 @@ func (p *tuiProgram) View() string {
 	}
 
 	// Final view: TopBar -> Header -> Content -> Bottom
-	return lipgloss.NewStyle().
-		Background(lipgloss.Color("0")).
-		Render(lipgloss.JoinVertical(lipgloss.Left, topBar, header, mainContent, bottom))
+	return lipgloss.NewStyle().Render(lipgloss.JoinVertical(lipgloss.Left, topBar, header, mainContent, bottom))
 }
