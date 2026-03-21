@@ -69,6 +69,12 @@ luckclaw 是一个基于 [nanobot](https://github.com/HKUDS/nanobot) 用 Golang 
    - **Agent**：直接运行 `luckclaw agent` 即可开始交互。
    - **TUI**：运行 `luckclaw tui` 启动终端 UI 交互（暂时只支持 ssh 终端）。
    - **Gateway**：运行 `luckclaw gateway` 启动网关，可通过配置通道平台接入与 agent 交互。
+4. **远程终端控制（可选）**：在任意会话中使用 `/terminal` 绑定 SSH 目标；启用后 `exec` 工具会在远端执行，web 类工具仍在本地执行。
+   - 添加：`/terminal add dev ssh user@1.2.3.4 --port 22 --identity ~/.ssh/id_rsa`
+   - 密码登录：`/terminal add dev ssh user@1.2.3.4 --password-env LUCKCLAW_SSH_PASS`（推荐）或 `--password <pass>`（仅内存，不落盘）
+   - 切换：`/terminal use dev`（或 `/terminal off` 回到本地）
+   - 传输：`/terminal upload ./file.txt /tmp/file.txt` 或 `/terminal download /tmp/file.txt ./file.txt`
+5. **远端 skills 执行（可选）**：当远程终端处于激活状态时，`/skill <name>` 会在远端主机用户目录下的远端工作区执行，并会禁止触碰本地文件。
 
 ***
 

@@ -70,6 +70,12 @@ luckclaw is a lightweight personal AI assistant rebuilt in Golang based on [nano
    - **Agent**: run `luckclaw agent` to start an interactive session.
    - **TUI**: run `luckclaw tui` to start the terminal UI (currently supports ssh terminals only).
    - **Gateway**: run `luckclaw gateway` to start the gateway, then connect a channel platform to interact with the agent.
+4. **Remote terminal control (optional)**: in any chat/session, use `/terminal` to bind an SSH target; when enabled, the `exec` tool runs on the remote host, while web tools still run locally.
+   - Add: `/terminal add dev ssh user@1.2.3.4 --port 22 --identity ~/.ssh/id_rsa`
+   - Password auth: `/terminal add dev ssh user@1.2.3.4 --password-env LUCKCLAW_SSH_PASS` (recommended) or `--password <pass>` (in-memory only)
+   - Use: `/terminal use dev` (or `/terminal off` to go back to local)
+   - Transfer: `/terminal upload ./file.txt /tmp/file.txt` or `/terminal download /tmp/file.txt ./file.txt`
+5. **Remote skills execution (optional)**: when a remote terminal is active, `/skill <name>` runs in a remote workspace under the remote host home directory and is prevented from touching local files.
 
 ### 1.6 Entry point and CLI
 
@@ -558,4 +564,3 @@ Run `luckclaw config` to enter the interactive TUI and configure:
 ## XII. License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
