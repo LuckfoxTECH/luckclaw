@@ -22,6 +22,7 @@ type SSHConn struct {
 	Port                  int    `json:"port"`
 	IdentityFile          string `json:"identity_file"`
 	PasswordEnv           string `json:"password_env"`
+	PasswordEnc           string `json:"password_enc,omitempty"`
 	Password              string `json:"-"`
 	BatchMode             bool   `json:"batch_mode"`
 	StrictHostKeyChecking bool   `json:"strict_host_key_checking"`
@@ -59,6 +60,10 @@ func (t *TerminalTransferTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"terminal": map[string]any{
+				"type":        "string",
+				"description": "Optional terminal name. If provided, the agent may select this terminal without activating it.",
+			},
 			"direction": map[string]any{
 				"type":        "string",
 				"description": "upload or download",
@@ -102,7 +107,7 @@ func (t *TerminalTransferTool) Execute(ctx context.Context, args map[string]any)
 		return "", fmt.Errorf("local_path and remote_path are required")
 	}
 
-	if t.AllowedDir == "" {
+	if strings.TrimSpace(t.BaseDir) == "" {
 		return "", fmt.Errorf("terminal_transfer requires workspace to be configured")
 	}
 	absLocal, err := resolvePath(localPath, t.BaseDir, t.AllowedDir)

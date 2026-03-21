@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -20,7 +21,7 @@ type ReadFileTool struct {
 
 func (t *ReadFileTool) Name() string { return "read_file" }
 func (t *ReadFileTool) Description() string {
-	return "Read the contents of a file at the given path. Supports text files and PDF (extracts text from PDF, up to 20MB)."
+	return "Read the contents of a file at the given path. Supports text files, PDF (extracts text, up to 20MB), and images (returns base64 data URI for vision models)."
 }
 func (t *ReadFileTool) Parameters() map[string]any {
 	return map[string]any{
@@ -39,7 +40,17 @@ const (
 	maxReadFileSize  = 128 * 1024       // 128KB for text files
 	maxPDFFileSize   = 20 * 1024 * 1024 // 20MB for PDF
 	maxExtractedText = 200 * 1024       // 200KB max extracted text (e.g. from PDF)
+	maxImageFileSize = 10 * 1024 * 1024 // 10MB for images
 )
+
+var imageExtensions = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".bmp":  "image/bmp",
+}
 
 func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) (string, error) {
 	_ = ctx
@@ -59,6 +70,10 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) (string
 	ext := strings.ToLower(filepath.Ext(resolved))
 	if ext == ".pdf" {
 		return t.readPDF(resolved, info.Size())
+	}
+
+	if mimeType, ok := imageExtensions[ext]; ok {
+		return t.readImage(resolved, info.Size(), mimeType)
 	}
 
 	if info.Size() > maxReadFileSize {
@@ -100,6 +115,18 @@ func (t *ReadFileTool) readPDF(path string, size int64) (string, error) {
 		return "[PDF: no extractable text (may be scanned/image-based)]", nil
 	}
 	return content, nil
+}
+
+func (t *ReadFileTool) readImage(path string, size int64, mimeType string) (string, error) {
+	if size > maxImageFileSize {
+		return "", fmt.Errorf("image is too large (%d bytes, limit is %d bytes)", size, maxImageFileSize)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading image: %w", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(b)
+	return fmt.Sprintf("[image: %s;base64,%s]", mimeType, encoded), nil
 }
 
 type WriteFileTool struct {
@@ -311,7 +338,15 @@ func resolvePath(path string, baseDir string, allowedDir string) (string, error)
 	if real == allowedReal {
 		return real, nil
 	}
-	if !strings.HasPrefix(real, allowedReal+string(filepath.Separator)) {
+	
+	// Add trailing separator to allowedReal for safe prefix checking, 
+	// but handle the case where allowedReal is already "/" (root directory)
+	allowedPrefix := allowedReal
+	if !strings.HasSuffix(allowedPrefix, string(filepath.Separator)) {
+		allowedPrefix += string(filepath.Separator)
+	}
+
+	if !strings.HasPrefix(real, allowedPrefix) {
 		return "", fmt.Errorf("path %s is outside allowed directory %s", path, allowedReal)
 	}
 	return real, nil

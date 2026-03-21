@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,12 +26,17 @@ type SSHTool struct {
 
 func (t *SSHTool) Name() string { return "ssh" }
 func (t *SSHTool) Description() string {
-	return "Run a command on a remote host via SSH. Provide host, command, and optional user/port/identity_file."
+	return "Run a command on a remote host via SSH, or check SSH reachability status."
 }
 func (t *SSHTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"action": map[string]any{
+				"type":        "string",
+				"description": "run (default) or status (check if host is reachable / ssh port responds)",
+				"enum":        []any{"run", "status"},
+			},
 			"host": map[string]any{
 				"type":        "string",
 				"description": "Remote host",
@@ -71,12 +77,19 @@ func (t *SSHTool) Parameters() map[string]any {
 				"type":        "boolean",
 				"description": "Enable StrictHostKeyChecking (default false)",
 			},
+			"connect_timeout_seconds": map[string]any{
+				"type":        "integer",
+				"description": "TCP connect/read timeout for status check (default 3)",
+				"minimum":     1,
+				"maximum":     60,
+			},
 		},
-		"required": []any{"host", "command"},
+		"required": []any{"host"},
 	}
 }
 
 func (t *SSHTool) Execute(ctx context.Context, args map[string]any) (string, error) {
+	action, _ := args["action"].(string)
 	host, _ := args["host"].(string)
 	user, _ := args["user"].(string)
 	identity, _ := args["identity_file"].(string)
@@ -86,7 +99,12 @@ func (t *SSHTool) Execute(ctx context.Context, args map[string]any) (string, err
 	port, _ := args["port"].(int)
 	batchModeVal, _ := args["batch_mode"].(bool)
 	strictHKCVal, _ := args["strict_host_key_checking"].(bool)
+	connectTimeoutSeconds, _ := args["connect_timeout_seconds"].(int)
 
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == "" {
+		action = "run"
+	}
 	host = strings.TrimSpace(host)
 	user = strings.TrimSpace(user)
 	identity = strings.TrimSpace(identity)
@@ -97,7 +115,7 @@ func (t *SSHTool) Execute(ctx context.Context, args map[string]any) (string, err
 	if host == "" {
 		return "", fmt.Errorf("host is required")
 	}
-	if cmdRemote == "" {
+	if action != "status" && cmdRemote == "" {
 		return "", fmt.Errorf("command is required")
 	}
 
@@ -105,11 +123,7 @@ func (t *SSHTool) Execute(ctx context.Context, args map[string]any) (string, err
 	if t.TimeoutSeconds > 0 {
 		timeout = time.Duration(t.TimeoutSeconds) * time.Second
 	}
-	if strings.TrimSpace(passwordEnv) != "" && strings.TrimSpace(password) == "" {
-		if v, ok := os.LookupEnv(passwordEnv); ok && strings.TrimSpace(v) != "" {
-			password = strings.TrimSpace(v)
-		}
-	}
+
 	conn := SSHConn{
 		Host:                  host,
 		User:                  user,
@@ -120,6 +134,22 @@ func (t *SSHTool) Execute(ctx context.Context, args map[string]any) (string, err
 		BatchMode:             batchModeVal || args["batch_mode"] == nil,
 		StrictHostKeyChecking: strictHKCVal,
 	}
+
+	if action == "status" {
+		ct := 3 * time.Second
+		if connectTimeoutSeconds > 0 {
+			ct = time.Duration(connectTimeoutSeconds) * time.Second
+		}
+		st := CheckSSHStatus(ctx, conn, ct)
+		b, _ := json.MarshalIndent(st, "", "  ")
+		return string(b), nil
+	}
+	if strings.TrimSpace(passwordEnv) != "" && strings.TrimSpace(password) == "" {
+		if v, ok := os.LookupEnv(passwordEnv); ok && strings.TrimSpace(v) != "" {
+			password = strings.TrimSpace(v)
+		}
+	}
+	conn.Password = password
 	return RunSSHCommand(ctx, conn, cmdRemote, timeout)
 }
 
@@ -279,6 +309,71 @@ func RunSSHCommand(ctx context.Context, c SSHConn, remoteCommand string, timeout
 		return strings.TrimSpace(full), err
 	}
 	return full, nil
+}
+
+type SSHStatus struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Reachable bool   `json:"reachable"`
+	SSH       bool   `json:"ssh"`
+	LatencyMs int64  `json:"latency_ms"`
+	Banner    string `json:"banner,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func CheckSSHStatus(ctx context.Context, c SSHConn, timeout time.Duration) SSHStatus {
+	port := c.Port
+	if port <= 0 {
+		port = 22
+	}
+	st := SSHStatus{Host: strings.TrimSpace(c.Host), Port: port}
+	if strings.TrimSpace(st.Host) == "" {
+		st.Error = "host is required"
+		return st
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	addr, err := sshAddr(c)
+	if err != nil {
+		st.Error = err.Error()
+		return st
+	}
+
+	start := time.Now()
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	st.LatencyMs = time.Since(start).Milliseconds()
+	if err != nil {
+		st.Reachable = false
+		st.SSH = false
+		st.Error = err.Error()
+		return st
+	}
+	defer conn.Close()
+	st.Reachable = true
+
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		st.SSH = false
+		st.Error = err.Error()
+		return st
+	}
+	banner := strings.TrimSpace(string(buf[:n]))
+	st.Banner = banner
+	if strings.HasPrefix(banner, "SSH-") {
+		st.SSH = true
+	} else {
+		st.SSH = false
+	}
+	return st
 }
 
 func UploadPath(ctx context.Context, c SSHConn, localPath string, remotePath string, recursive bool, timeout time.Duration) (string, error) {
