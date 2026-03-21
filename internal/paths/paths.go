@@ -97,3 +97,35 @@ func GatewayLogPath() (string, error) {
 	}
 	return filepath.Join(dir, "gateway.log"), nil
 }
+
+func ServiceDir() (string, error) {
+	dir, err := DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "services"), nil
+}
+
+func ServiceRegistryPath() (string, error) {
+	dir, err := ServiceDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "registry.json"), nil
+}
+
+func ServicePIDPath() (string, error) {
+	dir, err := ServiceDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "service.pid.json"), nil
+}
+
+func ServiceLogPath() (string, error) {
+	dir, err := ServiceDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "service.log"), nil
+}

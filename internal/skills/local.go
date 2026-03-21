@@ -314,7 +314,19 @@ Your workspace is at: %s
 - If a tool call fails, analyze the error before retrying with a different approach.
 - Ask for clarification when the request is ambiguous.
 
-Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.`,
+Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
+
+## Image Recognition
+When asked to recognize, describe, or analyze images:
+- If your model supports vision (check model name: gpt-4o, claude-3-5, gemini-1.5, qwen-vl, kimi-k2, etc.):
+  1. Use the read_file tool to read the image file (returns base64 data URI)
+  2. Analyze the base64 image content directly
+  3. Provide your analysis/description
+- If your model does NOT support vision:
+  - Suggest using a vision-capable model, or
+  - Suggest external OCR tools (tesseract, pytesseract)
+
+The read_file tool supports: .jpg, .jpeg, .png, .gif, .webp, .bmp (max 10MB).`,
 		runtime.GOOS, runtime.GOARCH, runtime.Version(), abs, abs, abs, abs, platformPolicy)
 }
 

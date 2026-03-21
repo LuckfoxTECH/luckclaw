@@ -28,6 +28,8 @@ type Message struct {
 	Content    any        `json:"content,omitempty"` // string or []ContentPart for multimodal
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+	RunMode    string     `json:"run_mode,omitempty"` // To track build/plan mode in history
+	RequestRaw string     `json:"-"`                  // Raw input before context injection
 }
 
 type ToolFunction struct {
@@ -46,6 +48,62 @@ type ToolCall struct {
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
 	Function ToolFunction `json:"function"`
+}
+
+type ContentPart interface {
+	contentPart()
+}
+
+type TextPart struct {
+	Text string `json:"text"`
+}
+
+func (TextPart) contentPart() {}
+
+type ImageURLDetail string
+
+const (
+	ImageURLDetailAuto ImageURLDetail = "auto"
+	ImageURLDetailLow  ImageURLDetail = "low"
+	ImageURLDetailHigh ImageURLDetail = "high"
+)
+
+type ImageURL struct {
+	URL    string         `json:"url"`
+	Detail ImageURLDetail `json:"detail,omitempty"`
+}
+
+type ImageURLPart struct {
+	Type     string   `json:"type"`
+	ImageURL ImageURL `json:"image_url"`
+}
+
+func (ImageURLPart) contentPart() {}
+
+func NewTextPart(text string) TextPart {
+	return TextPart{Text: text}
+}
+
+func NewImageURLPart(url string) ImageURLPart {
+	return ImageURLPart{
+		Type:     "image_url",
+		ImageURL: ImageURL{URL: url},
+	}
+}
+
+func NewImageURLPartWithDetail(url string, detail ImageURLDetail) ImageURLPart {
+	return ImageURLPart{
+		Type:     "image_url",
+		ImageURL: ImageURL{URL: url, Detail: detail},
+	}
+}
+
+func ContentPartsToAny(parts []ContentPart) []any {
+	out := make([]any, len(parts))
+	for i, p := range parts {
+		out[i] = p
+	}
+	return out
 }
 
 type ChatRequest struct {

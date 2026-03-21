@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"luckclaw/internal/paths"
+	"luckclaw/internal/utils"
 )
 
 type Message struct {
@@ -347,12 +348,12 @@ func (m *Manager) SetSummary(key string, summary string) error {
 
 // SessionInfo holds metadata for a session (for list/CLI display).
 type SessionInfo struct {
-	Key             string
-	Summary         string
-	CreatedAt       string
-	UpdatedAt       string
-	Path            string
-	RecentMessages  []string // Last few message previews for session list display
+	Key            string
+	Summary        string
+	CreatedAt      string
+	UpdatedAt      string
+	Path           string
+	RecentMessages []string // Last few message previews for session list display
 }
 
 func (m *Manager) ListSessions() ([]string, error) {
@@ -501,4 +502,44 @@ func (m *Manager) GetHistoryAligned(s *Session, maxMessages int) []map[string]an
 		return sliced[len(sliced)-keepCount:]
 	}
 	return nil
+}
+
+// GetHistoryByTokens returns recent messages fitting within tokenBudget.
+// Walks backwards from newest message, accumulates tokens until budget fills.
+// Returns messages in chronological order, aligned to a user turn.
+// Second return value is the estimated tokens used by the returned messages.
+func (m *Manager) GetHistoryByTokens(s *Session, tokenBudget int) ([]map[string]any, int) {
+	if s == nil || tokenBudget <= 0 {
+		return nil, 0
+	}
+	unconsolidated := s.Messages[s.LastConsolidated:]
+	if len(unconsolidated) == 0 {
+		return nil, 0
+	}
+
+	// Walk backwards, accumulate tokens
+	var tokensUsed int
+	cutIdx := len(unconsolidated) // exclusive
+	for i := len(unconsolidated) - 1; i >= 0; i-- {
+		t := utils.EstimateMessageTokens(unconsolidated[i])
+		if tokensUsed+t > tokenBudget && tokensUsed > 0 {
+			break
+		}
+		tokensUsed += t
+		cutIdx = i
+	}
+
+	sliced := unconsolidated[cutIdx:]
+
+	// Align to user turn
+	for i, msg := range sliced {
+		if role, _ := msg["role"].(string); role == "user" {
+			return sliced[i:], tokensUsed
+		}
+	}
+	// Fallback: keep last 3
+	if len(sliced) > 3 {
+		return sliced[len(sliced)-3:], tokensUsed
+	}
+	return sliced, tokensUsed
 }

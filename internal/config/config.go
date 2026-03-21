@@ -97,7 +97,10 @@ type AgentDefaults struct {
 	Temperature          float64 `json:"temperature"`
 	MaxToolIterations    int     `json:"maxToolIterations"`
 	ReasoningEffort      string  `json:"reasoningEffort,omitempty"`
-	MemoryWindow         int     `json:"memoryWindow,omitempty"`
+	MemoryWindow         int     `json:"memoryWindow,omitempty"`         // 消息数阈值（fallback）
+	MemoryWindowTokens   int     `json:"memoryWindowTokens,omitempty"`   // Token 阈值（优先）
+	MaxContextTokens     int     `json:"maxContextTokens,omitempty"`     // 上下文总 token 截断阈值
+	MaxMemoryInjectChars int     `json:"maxMemoryInjectChars,omitempty"` // 记忆注入字符上限
 	MaxMessages          int     `json:"maxMessages,omitempty"`
 	ConsolidationTimeout int     `json:"consolidationTimeout,omitempty"`
 	MaxRetries           int     `json:"maxRetries,omitempty"`
@@ -131,6 +134,10 @@ type AgentDefaults struct {
 	// When enabled, messages scoring below SimpleThreshold use compact context (no always-skills, no USER/SOUL, no memory).
 	TokenBudget *TokenBudgetConfig `json:"tokenBudget,omitempty"`
 
+	// ShortTermMemory: token-based tiered history retention.
+	// Controls how recent conversation detail is preserved in both normal and simple mode.
+	ShortTermMemory *ShortTermMemoryConfig `json:"shortTermMemory,omitempty"`
+
 	// ResourceConstrained: if true, don't auto-download packages, only provide suggestions
 	// Useful for resource-limited environments (e.g., embedded devices, low-storage systems)
 	ResourceConstrained bool `json:"resourceConstrained,omitempty"`
@@ -140,6 +147,22 @@ type AgentDefaults struct {
 type TokenBudgetConfig struct {
 	Enabled         bool    `json:"enabled"`
 	SimpleThreshold float64 `json:"simpleThreshold"` // 0-1; score < threshold → compact mode. Default 0.35.
+}
+
+// ShortTermMemoryConfig controls token-based tiered history retention.
+type ShortTermMemoryConfig struct {
+	// RecentTokenBudget: token budget for recent full-detail messages.
+	// Messages included from newest backwards until budget fills.
+	// Default 4000 (~1000 words, ~5 conversation turns).
+	RecentTokenBudget int `json:"recentTokenBudget,omitempty"`
+
+	// EnableMiddleCompression: compress messages outside budget into
+	// key-entity summary injected into system prompt. Default true.
+	EnableMiddleCompression bool `json:"enableMiddleCompression,omitempty"`
+
+	// MiddleSummaryMaxChars: max chars for middle-layer summary in system prompt.
+	// Default 2000.
+	MiddleSummaryMaxChars int `json:"middleSummaryMaxChars,omitempty"`
 }
 
 // RoutingConfig controls intelligent model routing by message complexity.
@@ -435,7 +458,15 @@ func Default() Config {
 				Temperature:          0.1,
 				MaxToolIterations:    40,
 				MemoryWindow:         20,
+				MemoryWindowTokens:   8000,
+				MaxContextTokens:     100000,
+				MaxMemoryInjectChars: 4000,
 				MaxMessages:          500,
+				ShortTermMemory: &ShortTermMemoryConfig{
+					RecentTokenBudget:       4000,
+					EnableMiddleCompression: true,
+					MiddleSummaryMaxChars:   2000,
+				},
 				ConsolidationTimeout: 30,
 				VerboseDefault:       true,
 				MaxConcurrent:        4,
@@ -1031,6 +1062,25 @@ func applyAgentDefault(d *AgentDefaults, field, val string) {
 			}
 			d.TokenBudget.SimpleThreshold = v
 		}
+	case "shorttermmemory_recenttokenbudget":
+		if v := parseInt(val); v > 0 {
+			if d.ShortTermMemory == nil {
+				d.ShortTermMemory = &ShortTermMemoryConfig{}
+			}
+			d.ShortTermMemory.RecentTokenBudget = v
+		}
+	case "shorttermmemory_enablemiddlecompression":
+		if d.ShortTermMemory == nil {
+			d.ShortTermMemory = &ShortTermMemoryConfig{}
+		}
+		d.ShortTermMemory.EnableMiddleCompression = (val == "true" || val == "1" || val == "on")
+	case "shorttermmemory_middlesummarymaxchars":
+		if v := parseInt(val); v > 0 {
+			if d.ShortTermMemory == nil {
+				d.ShortTermMemory = &ShortTermMemoryConfig{}
+			}
+			d.ShortTermMemory.MiddleSummaryMaxChars = v
+		}
 	}
 }
 
@@ -1232,6 +1282,11 @@ func DefaultFullTemplateMap() map[string]any {
 				"tokenBudget": map[string]any{
 					"enabled":         true,
 					"simpleThreshold": 0.35,
+				},
+				"shortTermMemory": map[string]any{
+					"recentTokenBudget":       4000,
+					"enableMiddleCompression": true,
+					"middleSummaryMaxChars":   2000,
 				},
 			},
 			"subagents": map[string]any{

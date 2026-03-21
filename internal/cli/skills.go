@@ -2,12 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"strings"
-	"text/tabwriter"
 
+	"luckclaw/internal/command"
 	"luckclaw/internal/config"
 	"luckclaw/internal/paths"
-	"luckclaw/internal/skills"
 
 	"github.com/spf13/cobra"
 )
@@ -35,53 +33,24 @@ func newSkillsListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := paths.ExpandUser(cfg.Agents.Defaults.Workspace)
+
+			// Use unified command handler
+			handler := &command.SkillsHandler{}
+			input := command.Input{
+				Args:   args,
+				Config: &cfg,
+				Writer: cmd.OutOrStdout(),
+			}
+
+			output, err := handler.Execute(input)
 			if err != nil {
 				return err
 			}
-			ss, err := skills.Discover(ws)
-			if err != nil {
-				return err
+			if output.Error != nil {
+				return output.Error
 			}
-			if len(ss) == 0 {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No skills found. Create workspace/skills/<name>/SKILL.md")
-				return nil
-			}
-			const maxDesc = 56
-			trunc := func(s string, n int) string {
-				s = strings.TrimSpace(s)
-				r := []rune(s)
-				if len(r) <= n {
-					return s
-				}
-				return string(r[:n-3]) + "..."
-			}
-			w := tabwriter.NewWriter(cmd.OutOrStdout(), 4, 0, 2, ' ', 0)
-			for _, s := range ss {
-				state := "available"
-				if !s.Available {
-					state = "unavailable"
-				}
-				desc := strings.TrimSpace(s.Description)
-				if desc == "" {
-					desc = "(no description)"
-				}
-				desc = trunc(desc, maxDesc)
-				reason := ""
-				if !s.Available {
-					missingBins, missingEnv := skills.MissingRequires(s.Requires)
-					parts := []string{}
-					if len(missingEnv) > 0 {
-						parts = append(parts, "missing env: "+strings.Join(missingEnv, ", "))
-					}
-					if len(missingBins) > 0 {
-						parts = append(parts, "missing bins: "+strings.Join(missingBins, ", "))
-					}
-					reason = strings.Join(parts, "; ")
-				}
-				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, state, s.Path, desc, reason)
-			}
-			_ = w.Flush()
+
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), output.Content)
 			return nil
 		},
 	}

@@ -9,6 +9,30 @@ import (
 
 type ChatFunc func(ctx context.Context, message, sessionKey, channel, chatID string, media []string) (string, bool, error)
 
+func isSlashCommand(message string) bool {
+	s := strings.TrimSpace(message)
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "```") {
+		lines := strings.Split(s, "\n")
+		if len(lines) >= 3 && strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "```") {
+			inner := strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
+			for _, prefix := range []string{"/", "／", "⁄", "∕"} {
+				if strings.HasPrefix(inner, prefix) {
+					return true
+				}
+			}
+		}
+	}
+	for _, prefix := range []string{"/", "／", "⁄", "∕"} {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 type queueResult struct {
 	Response string
 	Streamed bool
@@ -229,10 +253,23 @@ func (q *Queue) runWorker(key string, w *sessionWorker) {
 		}()
 	}
 
-	processBatch := func(reqs []*queueRequest) {
+	var processBatch func(reqs []*queueRequest)
+	processBatch = func(reqs []*queueRequest) {
 		if len(reqs) == 0 {
 			return
 		}
+
+		if len(reqs) > 1 {
+			for _, r := range reqs {
+				if isSlashCommand(r.message) {
+					for _, rr := range reqs {
+						processBatch([]*queueRequest{rr})
+					}
+					return
+				}
+			}
+		}
+
 		// Merge: use first req's metadata, concatenate messages
 		first := reqs[0]
 		mergedMsg := first.message

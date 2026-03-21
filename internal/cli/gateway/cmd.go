@@ -20,6 +20,7 @@ import (
 	"luckclaw/internal/logging"
 	"luckclaw/internal/paths"
 	"luckclaw/internal/providers/openaiapi"
+	"luckclaw/internal/service"
 	sessionpkg "luckclaw/internal/session"
 
 	"github.com/spf13/cobra"
@@ -245,6 +246,15 @@ func NewCmd() *cobra.Command {
 			}()
 
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Starting luckclaw gateway on port %d...\n", port)
+
+			// Restore auto-start services
+			if svcReg := service.GlobalRegistry(); svcReg.Load() == nil {
+				if errs := svcReg.RestoreAutoStart(ctx); len(errs) > 0 {
+					for _, err := range errs {
+						log.Printf("[service] auto-start warning: %v", err)
+					}
+				}
+			}
 
 			var wg sync.WaitGroup
 

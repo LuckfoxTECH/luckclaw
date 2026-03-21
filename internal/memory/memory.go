@@ -11,20 +11,26 @@ import (
 
 	"luckclaw/internal/providers/openaiapi"
 	"luckclaw/internal/session"
+	"luckclaw/internal/utils"
 )
 
 type Store struct {
-	MemoryDir   string
-	MemoryFile  string
-	HistoryFile string
+	MemoryDir      string
+	MemoryFile     string
+	HistoryFile    string
+	MaxInjectChars int
 }
 
-func NewStore(workspace string) *Store {
+func NewStore(workspace string, maxInjectChars int) *Store {
 	dir := filepath.Join(workspace, "memory")
+	if maxInjectChars <= 0 {
+		maxInjectChars = 4000
+	}
 	return &Store{
-		MemoryDir:   dir,
-		MemoryFile:  filepath.Join(dir, "MEMORY.md"),
-		HistoryFile: filepath.Join(dir, "HISTORY.md"),
+		MemoryDir:      dir,
+		MemoryFile:     filepath.Join(dir, "MEMORY.md"),
+		HistoryFile:    filepath.Join(dir, "HISTORY.md"),
+		MaxInjectChars: maxInjectChars,
 	}
 }
 
@@ -61,7 +67,14 @@ func (s *Store) GetMemoryContext() string {
 	if lt == "" {
 		return ""
 	}
-	return "## Long-term Memory\n" + lt
+
+	prefix := "## Long-term Memory\n"
+	maxContentLen := s.MaxInjectChars - len(prefix) - 20
+
+	if maxContentLen > 0 && len(lt) > maxContentLen {
+		return prefix + lt[:maxContentLen] + "\n\n[... memory truncated ...]"
+	}
+	return prefix + lt
 }
 
 var saveMemoryToolDef = []openaiapi.ToolDefinition{
@@ -197,9 +210,6 @@ func (s *Store) Consolidate(
 	return true, nil
 }
 
-// ConsolidateWithTimeout wraps Consolidate with a dedicated timeout and
-// snapshot-based rollback. If the LLM call exceeds the timeout, the
-// existing MEMORY.md is guaranteed to remain intact.
 func (s *Store) ConsolidateWithTimeout(
 	ctx context.Context,
 	sess *session.Session,
@@ -228,9 +238,44 @@ func (s *Store) ConsolidateWithTimeout(
 	return ok, nil
 }
 
-// BuildOverflowNote returns a context note to inject into the message array
-// when older messages are skipped. If long-term memory exists, the note
-// references it; otherwise it warns about lost context.
+type ConsolidationThreshold struct {
+	MessageCount int
+	TokenCount   int
+}
+
+func (s *Store) ShouldConsolidate(sess *session.Session, threshold ConsolidationThreshold) (bool, string) {
+	unconsolidated := sess.Messages[sess.LastConsolidated:]
+	if len(unconsolidated) == 0 {
+		return false, ""
+	}
+
+	if threshold.TokenCount > 0 {
+		unconsolidatedTokens := utils.EstimateTokens(unconsolidated)
+		if unconsolidatedTokens >= threshold.TokenCount {
+			return true, fmt.Sprintf("token threshold: %d >= %d", unconsolidatedTokens, threshold.TokenCount)
+		}
+	}
+
+	if threshold.MessageCount > 0 && len(unconsolidated) >= threshold.MessageCount {
+		return true, fmt.Sprintf("message threshold: %d >= %d", len(unconsolidated), threshold.MessageCount)
+	}
+
+	return false, ""
+}
+
+func (s *Store) ShouldTruncate(sess *session.Session, totalTokenLimit int) (bool, string) {
+	if totalTokenLimit <= 0 {
+		return false, ""
+	}
+
+	totalTokens := utils.EstimateTokens(sess.Messages)
+	if totalTokens >= totalTokenLimit {
+		return true, fmt.Sprintf("total token limit: %d >= %d", totalTokens, totalTokenLimit)
+	}
+
+	return false, ""
+}
+
 func (s *Store) BuildOverflowNote(skipped int) string {
 	if s.ReadLongTerm() != "" {
 		return fmt.Sprintf(

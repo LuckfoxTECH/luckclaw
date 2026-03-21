@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 
+	"luckclaw/internal/command"
 	"luckclaw/internal/config"
 	"luckclaw/internal/paths"
 
@@ -31,18 +32,24 @@ func newModelsListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result := cfg.ListAvailableModels()
-			for _, e := range result.FetchErrors {
-				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Warning: "+e)
+
+			// Use unified command handler
+			handler := &command.ModelsHandler{}
+			input := command.Input{
+				Args:   args,
+				Config: &cfg,
+				Writer: cmd.OutOrStdout(),
 			}
-			if len(result.Models) == 0 {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No models available. Configure API keys and apiBase in ~/.luckclaw/config.json. If API fetch failed, check the warnings above.")
-				return nil
+
+			output, err := handler.Execute(input)
+			if err != nil {
+				return err
 			}
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Available models:")
-			for _, m := range result.Models {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  • %s\n", m)
+			if output.Error != nil {
+				return output.Error
 			}
+
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), output.Content)
 			return nil
 		},
 	}

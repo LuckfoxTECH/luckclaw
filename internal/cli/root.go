@@ -6,6 +6,7 @@ import (
 
 	"luckclaw/internal/cli/gateway"
 	"luckclaw/internal/cli/tui"
+	"luckclaw/internal/service"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/common-nighthawk/go-figure"
@@ -52,6 +53,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(tui.NewCmd())
 	root.AddCommand(gateway.NewCmd())
+	root.AddCommand(service.NewCmd())
 	root.AddCommand(newModelsCmd())
 	root.AddCommand(newCronCmd())
 	root.AddCommand(newChannelsCmd())
@@ -59,6 +61,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newTerminalCmd())
 	root.AddCommand(newSkillsCmd())
 	root.AddCommand(newClawhubCmd())
+	root.AddCommand(newMqttCmd())
 
 	return root
 }

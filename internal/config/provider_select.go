@@ -289,6 +289,23 @@ func SupportsPromptCaching(provider string) bool {
 	}
 }
 
+// SupportsVision returns true if the model name indicates vision capability.
+// This is a heuristic based on known vision model naming patterns.
+func SupportsVision(model string) bool {
+	model = strings.ToLower(model)
+	visionIndicators := []string{
+		"vision", "gpt-4o", "gpt-4-turbo", "claude-3-opus", "claude-3-sonnet",
+		"claude-3-5", "gemini-1.5", "gemini-pro-vision", "qwen-vl", "qwen2-vl",
+		"kimi-k2", "minimax-k2", "volcengine-k2", "yi-vision", "qwen3.5-plus",
+	}
+	for _, indicator := range visionIndicators {
+		if strings.Contains(model, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
 // NormalizeProviderAPIBase fills empty provider apiBase with default URLs.
 // Call from Normalize so config always has apiBase for display and persistence.
 func NormalizeProviderAPIBase(c *Config) {

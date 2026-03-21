@@ -137,6 +137,7 @@ func createSkillsTemplates(workspace string, prevErr error) error {
 		content string
 	}{
 		{"clawhub", clawhubSkillTemplate},
+		{"web-design-guide", webDesignGuideSkillTemplate},
 	}
 	for _, s := range skills {
 		dir := filepath.Join(workspace, "skills", s.dir)
@@ -316,4 +317,41 @@ Public skill registry for AI agents. Use built-in tools (no Node.js).
 ## CLI (optional)
 
 User can also run: luckclaw clawhub search "query", luckclaw clawhub install <slug>.
+`
+
+const webDesignGuideSkillTemplate = `---
+name: "web-design-guide"
+description: "MANDATORY guidelines for the web_design tool. Invoke BEFORE creating/updating web UIs, or when encountering missing parameter errors (like ui.controls or host/value)."
+---
+
+# Web Design Tool Guidelines
+
+When using the ` + "`web_design`" + ` tool, you MUST strictly follow these rules to avoid common errors and ensure successful UI creation and binding:
+
+## 1. UI Specifications are Mandatory
+- When executing ` + "`create`" + ` or ` + "`update`" + ` actions, you **MUST** provide either a complete ` + "`ui.controls`" + ` JSON array or full ` + "`html`" + ` content.
+- **NEVER** provide only ` + "`bindings`" + ` or ` + "`requirements`" + ` during an update. Doing so will trigger a ` + "`ui.controls or html is required`" + ` error.
+- **Do NOT** generate default Debug, Ping, or Log templates unless explicitly requested by the user.
+
+## 2. Modbus & MQTT Bindings
+- **No Device Aliases**: You CANNOT just pass a ` + "`\"device\": \"alias\"`" + ` in your bindings. You MUST explicitly provide the physical connection parameters.
+- **Modbus Parameters**: For operations like ` + "`modbus_write_single_coil`" + ` or ` + "`modbus_write_single_register`" + `, you MUST include:
+  - ` + "`host`" + ` (e.g., "192.168.1.100")
+  - ` + "`port`" + ` (e.g., 502)
+  - ` + "`unit_id`" + ` (e.g., 1)
+  - ` + "`address`" + ` (the register/coil address)
+  - ` + "`value`" + ` (e.g., ` + "`true`/`false`" + ` for coils, or an integer for registers)
+- **MQTT Parameters**: For ` + "`mqtt_publish`" + `, you MUST include:
+  - ` + "`broker`" + ` (e.g., "tcp://127.0.0.1:1883")
+  - ` + "`topic`" + ` (e.g., "factory/cmd")
+  - ` + "`content`" + ` or ` + "`payload`" + ` (the message to send)
+  - Optional: ` + "`client_id`" + `, ` + "`username`" + `, ` + "`password`" + `, ` + "`qos`" + `, ` + "`retained`" + `
+- **Missing Parameters Error**: If you see errors like ` + "`host is required for modbus_write_single_coil`" + ` or ` + "`broker and topic are required for mqtt_publish`" + `, query the device configuration, extract the physical parameters, and include them in the binding before retrying.
+
+## 3. Script and File Bindings
+- **` + "`write_script`" + `**: This binding *generates* a script file; it does **NOT** execute it. It requires both ` + "`path`" + ` and ` + "`content`" + `.
+- **Executing Scripts**: If you need to execute a shell command via a web button, prefer using standard ` + "`action`" + ` events without backend bindings. You (the Agent) should then poll these events via ` + "`pull_events`" + ` and use the standard shell/exec tools to run the required scripts.
+
+## 4. Path Rules
+- For ` + "`write_file`" + `, ` + "`append_file`" + `, or ` + "`write_script`" + `, always prefer **relative paths** (e.g., ` + "`state.txt`" + `) to avoid out-of-workspace write rejections.
 `

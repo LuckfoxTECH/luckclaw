@@ -3,6 +3,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -11,8 +13,10 @@ import (
 	"luckclaw/internal/agent"
 	"luckclaw/internal/bus"
 	"luckclaw/internal/config"
+	"luckclaw/internal/logging"
 	"luckclaw/internal/paths"
 	"luckclaw/internal/providers/openaiapi"
+	"luckclaw/internal/service"
 	sessionpkg "luckclaw/internal/session"
 	"luckclaw/internal/tools"
 
@@ -152,12 +156,12 @@ type slashCommand struct {
 func getSlashCommands(cfg config.Config) []slashCommand {
 	cmdList := []slashCommand{
 		{"/help", "Show help message"},
-		{"/new", "Start new conversation (consolidates memory)"},
+		{"/new", "Start new conversation"},
+		{"/compact", "Consolidate memory and start new conversation"},
 		{"/reset", "Clear conversation without memory consolidation"},
 		{"/verbose", "Toggle verbose mode"},
 		{"/terminal", "Manage and switch remote terminal control"},
-		{"/model", "Show or switch model"},
-		{"/models", "List available models"},
+		{"/models", "List available models or switch model: /models <id>"},
 		{"/plan", "Planning mode: /plan <task> | /plan on | /plan off"},
 		{"/skill", "List skills; /skill <name> to run a skill"},
 		{"/simple", "Toggle simple mode (compact context, saves tokens)"},
@@ -165,11 +169,14 @@ func getSlashCommands(cfg config.Config) []slashCommand {
 		{"/luck", "Record last completed task as lucky; /luck last to preview; /luck list to show events"},
 		{"/badluck", "Record last completed task as bad luck; /badluck last to preview; /badluck list to show events"},
 		{"/turn", "Temporary perspective shift; /turn reroll | status | on | off | save | clear"},
+		{"/modbus", "Manage per-workspace Modbus devices and config: list, add, info, rm, use, off"},
+		{"/mqtt", "Manage MQTT connections: list, add, connect, disconnect, info, rm, logs"},
 		{"/stop", "Cancel current processing"},
 		{"/sessions", "Manage and switch between sessions"},
 		{"/heartbeat", "Show heartbeat status (gateway only)"},
 		{"/mcp", "List connected MCP tools"},
 		{"/subagents", "List/kill/info/spawn subagent runs"},
+		{"/service", "Manage services: /service list | add | rm | info | start | stop | search"},
 	}
 	if cfg.SlashCommands != nil {
 		for name, c := range cfg.SlashCommands {
@@ -202,6 +209,9 @@ func filterSlashCompletions(prefix string, all []slashCommand) []slashCommand {
 			out = append(out, c)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
 	return out
 }
 
@@ -246,9 +256,19 @@ func NewCmd() *cobra.Command {
 			if ws, err := paths.ExpandUser(cfg.Agents.Defaults.Workspace); err == nil && ws != "" {
 				sessions.Workspace = ws
 			}
-			loop := agent.New(cfg, client, sessions, model, nil)
+			logger := logging.NewMemoryLogger(2000)
+			loop := agent.New(cfg, client, sessions, model, logger)
 			tuiBus := bus.New()
 			loop.SetBus(tuiBus)
+
+			// Restore auto-start services
+			if svcReg := service.GlobalRegistry(); svcReg.Load() == nil {
+				if errs := svcReg.RestoreAutoStart(context.Background()); len(errs) > 0 {
+					for _, err := range errs {
+						log.Printf("[service] auto-start warning: %v", err)
+					}
+				}
+			}
 
 			status := &tuiStatus{
 				Status:        "idle",
@@ -288,8 +308,9 @@ func NewCmd() *cobra.Command {
 				slashCommands: getSlashCommands(cfg),
 				thinkingText:  thinkingText,
 				renamingIdx:   -1,
+				mouseEnabled:  true,
 			}
-			p := tea.NewProgram(prog, tea.WithAltScreen())
+			p := tea.NewProgram(prog, tea.WithMouseCellMotion())
 			go func() {
 				for msg := range tuiBus.Outbound {
 					p.Send(outboundMsg{Content: msg.Content, Type: msg.Type})
@@ -309,6 +330,7 @@ func NewCmd() *cobra.Command {
 type chatMessage struct {
 	role    string // "user" | "assistant"
 	content string
+	runMode tools.RunMode
 }
 
 type tuiProgram struct {
@@ -334,6 +356,7 @@ type tuiProgram struct {
 	scrollOffset int
 	// thinkingText from ux.placeholder.text for typing indicator
 	thinkingText string
+	mouseEnabled bool
 
 	// Sessions management
 	showSessions  bool
@@ -461,21 +484,26 @@ func (p *tuiProgram) buildContentString() string {
 	if width <= 0 {
 		width = 80
 	}
-	// User message: left border accent
-	userBgStyle := lipgloss.NewStyle().
-		Padding(0, 1).
-		Border(lipgloss.Border{
-			Left: "┃",
-		}, false, false, false, true).
-		BorderForeground(lipgloss.Color("12")).
-		Width(width)
-
 	assistantStyle := lipgloss.NewStyle().Width(width)
 	var contentBlocks []string
 	for _, msg := range p.messages {
 		if msg.role == "user" {
 			wrapped := wordWrapANSI(msg.content, width-4)
-			contentBlocks = append(contentBlocks, userBgStyle.Render(wrapped))
+			// Apply user background and border color dynamically based on runMode when sent
+			accentColor := lipgloss.Color("62") // default Build mode border color
+			if msg.runMode == tools.RunModePlan {
+				accentColor = lipgloss.Color("39") // Plan mode border color
+			}
+			userStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252")). // Ensure text is visible
+				Padding(0, 1).
+				Border(lipgloss.Border{
+					Left: "┃",
+				}, false, false, false, true).
+				BorderForeground(accentColor).
+				Width(width)
+
+			contentBlocks = append(contentBlocks, userStyle.Render(wrapped))
 		} else {
 			rendered := p.renderMarkdown(msg.content)
 			contentBlocks = append(contentBlocks, assistantStyle.Render(rendered))
@@ -504,16 +532,27 @@ func (p *tuiProgram) buildContentString() string {
 // handleSend returns tea.Cmd for sending a message. For /stop, cancels in-flight
 // processing and sets status to "stop" instead of running the agent.
 func (p *tuiProgram) handleSend(input string) tea.Cmd {
-	if strings.TrimSpace(input) == "/stop" {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "/stop" {
 		p.loop.Queue.CancelSessionAndChildren(p.session)
 		p.status.SetStatus("stop")
 		p.messages = append(p.messages, chatMessage{role: "assistant", content: "Stopped."})
 		return nil
 	}
-	if strings.TrimSpace(input) == "/sessions" {
+	if trimmed == "/sessions" {
 		p.showSessions = true
 		p.sessionIdx = 0
 		return p.loadSessionsCmd()
+	}
+	if trimmed == "/new" {
+		newSession := fmt.Sprintf("tui:%d", time.Now().Unix())
+		p.session = newSession
+		p.messages = []chatMessage{}
+		p.scrollOffset = 0
+		p.resetHistoryBrowsing()
+		p.addInputHistory(trimmed)
+		p.messages = append(p.messages, chatMessage{role: "assistant", content: "New session created."})
+		return nil
 	}
 	return tea.Batch(
 		tea.Cmd(func() tea.Msg { return agentStartMsg{} }),
@@ -595,20 +634,36 @@ func (p *tuiProgram) updateSessions(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return p, nil
 		case "enter":
 			if p.sessionIdx >= 0 && p.sessionIdx < len(p.sessionList) {
+				oldSession := p.session
 				p.session = p.sessionList[p.sessionIdx].Key
-				p.messages = []chatMessage{}
-				p.scrollOffset = 0
-				p.resetHistoryBrowsing()
-				p.inputHistory = nil
-				// Load messages for new session
-				s, _ := p.loop.Sessions.GetOrCreate(p.session)
-				for _, msg := range s.Messages {
-					role, _ := msg["role"].(string)
-					content, _ := msg["content"].(string)
-					p.messages = append(p.messages, chatMessage{role: role, content: content})
-					if role == "user" {
-						p.addInputHistory(content)
+				if oldSession != p.session {
+					if trimmed := strings.TrimSpace(p.input); trimmed != "" {
+						p.addInputHistory(trimmed)
 					}
+					p.input = ""
+					p.inputPos = 0
+					p.messages = []chatMessage{}
+					p.scrollOffset = 0
+					p.resetHistoryBrowsing()
+					s, _ := p.loop.Sessions.GetOrCreate(p.session)
+					for _, msg := range s.Messages {
+						role, _ := msg["role"].(string)
+						content, _ := msg["content"].(string)
+
+						mode := tools.RunModeBuild
+						if rm, ok := msg["run_mode"].(string); ok && rm != "" {
+							mode = tools.RunMode(rm)
+						}
+
+						p.messages = append(p.messages, chatMessage{role: role, content: content, runMode: mode})
+						if role == "user" {
+							p.addInputHistory(content)
+						}
+					}
+
+					// Scroll to bottom when loading an existing session
+					totalLines, contentHeight := p.contentLineCount()
+					p.scrollOffset = p.scrollMax(totalLines, contentHeight)
 				}
 				p.showSessions = false
 				return p, nil
@@ -637,6 +692,22 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return p.updateSessions(msg)
 	}
 	switch m := msg.(type) {
+	case tea.MouseMsg:
+		if m.Button == tea.MouseButtonWheelUp {
+			if p.scrollOffset > 0 {
+				p.scrollOffset--
+			}
+			return p, nil
+		}
+		if m.Button == tea.MouseButtonWheelDown {
+			totalLines, contentHeight := p.contentLineCount()
+			maxScroll := p.scrollMax(totalLines, contentHeight)
+			if p.scrollOffset < maxScroll {
+				p.scrollOffset++
+			}
+			return p, nil
+		}
+		return p, nil
 	case tea.KeyMsg:
 		filtered := p.filteredCompletions()
 		hasCompletions := len(filtered) > 0
@@ -644,6 +715,12 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.String() {
 		case "ctrl+c", "ctrl+d":
 			return p, tea.Quit
+		case "alt+m":
+			p.mouseEnabled = !p.mouseEnabled
+			if p.mouseEnabled {
+				return p, func() tea.Msg { return tea.EnableMouseCellMotion() }
+			}
+			return p, func() tea.Msg { return tea.DisableMouse() }
 		case "tab":
 			if hasCompletions {
 				p.completionIndex = (p.completionIndex + 1) % len(filtered)
@@ -681,10 +758,6 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if p.historyUp() {
 				return p, nil
 			}
-			// Scroll content up when not in completions
-			if p.scrollOffset > 0 {
-				p.scrollOffset--
-			}
 			return p, nil
 		case "down":
 			if p.historyIndex != -1 && p.historyDown() {
@@ -696,12 +769,6 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if p.historyDown() {
 				return p, nil
-			}
-			// Scroll content down when not in completions
-			totalLines, contentHeight := p.contentLineCount()
-			maxScroll := p.scrollMax(totalLines, contentHeight)
-			if p.scrollOffset < maxScroll {
-				p.scrollOffset++
 			}
 			return p, nil
 		case "pgup":
@@ -734,7 +801,7 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					p.input = ""
 					p.inputPos = 0
 					p.completionIndex = 0
-					p.messages = append(p.messages, chatMessage{role: "user", content: inputTrim})
+					p.messages = append(p.messages, chatMessage{role: "user", content: inputTrim, runMode: p.runMode})
 					return p, p.handleSend(inputTrim)
 				}
 				// Partial input, apply completion
@@ -776,7 +843,7 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				p.inputPos = 0
 				p.completionIndex = 0
 				if input != "" {
-					p.messages = append(p.messages, chatMessage{role: "user", content: input})
+					p.messages = append(p.messages, chatMessage{role: "user", content: input, runMode: p.runMode})
 					return p, p.handleSend(input)
 				}
 			}
@@ -1121,10 +1188,10 @@ func (p *tuiProgram) View() string {
 	}
 	statusStr = fmt.Sprintf("%s | %s | %s", modePart, statusStr, model)
 
-	// Accent colors: running: green; stop: amber; idle: blue(Build) or cyan(Plan)
+	// Accent colors: running: green; stop: amber; idle: blue(Build) or dark blue(Plan)
 	accentColor := lipgloss.Color("62") // blue (idle Build)
 	if p.runMode == tools.RunModePlan {
-		accentColor = lipgloss.Color("39") // cyan/blue (idle Plan)
+		accentColor = lipgloss.Color("24") // dark blue (idle Plan)
 	}
 
 	if isRunning {
@@ -1154,7 +1221,7 @@ func (p *tuiProgram) View() string {
 	inputLine := inputStyle.Render(renderSingleLineInput(p.input, p.inputPos, innerWidth))
 
 	// Footer: help hint below status bar
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).Render("Type /help for commands. | Tab: toggle plan/build")
+	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).Render("Type /help for commands. | Tab: toggle plan/build | Alt+M: toggle mouse capture")
 
 	// Content area (between header and input) - scrollable
 	content := p.buildContentString()
