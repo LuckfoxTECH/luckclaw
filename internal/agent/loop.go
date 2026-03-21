@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"luckclaw/internal/bus"
+	"luckclaw/internal/command"
 	"luckclaw/internal/config"
 	"luckclaw/internal/cron"
 	"luckclaw/internal/logging"
@@ -20,9 +21,11 @@ import (
 	"luckclaw/internal/paths"
 	"luckclaw/internal/providers/openaiapi"
 	"luckclaw/internal/routing"
+	"luckclaw/internal/service"
 	"luckclaw/internal/session"
 	"luckclaw/internal/skills"
 	"luckclaw/internal/tools"
+	"luckclaw/internal/utils"
 )
 
 const toolResultMaxChars = 500
@@ -91,6 +94,9 @@ type AgentLoop struct {
 	terminalSecretsMu sync.Mutex
 	terminalPasswords map[string]map[string]string
 
+	activeTerminalsMu sync.Mutex
+	activeTerminals   map[string]string
+
 	// OnTurnComplete is an optional callback for TUI/CLI to report token usage after each turn.
 	// channel, chatID: for routing (e.g. webui sends to WebSocket session).
 	OnTurnComplete func(channel, chatID string, model string, promptTokens, completionTokens, totalTokens int)
@@ -106,6 +112,12 @@ type AgentLoop struct {
 
 func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Manager, model string, logger logging.Logger) *AgentLoop {
 	ws, _ := paths.ExpandUser(cfg.Agents.Defaults.Workspace)
+	ws = strings.TrimSpace(ws)
+	if ws == "" {
+		if v, err := paths.WorkspaceDir(); err == nil {
+			ws = strings.TrimSpace(v)
+		}
+	}
 	allowedDir := ""
 	if cfg.Tools.RestrictToWorkspace && ws != "" {
 		allowedDir = ws
@@ -131,6 +143,15 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 		AllowedDir:     allowedDir,
 		BaseDir:        baseDir,
 		TimeoutSeconds: cfg.Tools.Exec.Timeout,
+	})
+	registry.Register(&tools.WebDesignTool{
+		Workspace:           ws,
+		AllowedDir:          allowedDir,
+		RestrictToWorkspace: cfg.Tools.RestrictToWorkspace,
+		Logger:              logger,
+	})
+	registry.Register(&tools.ModbusTCPTool{
+		Workspace: ws,
 	})
 	if wsTool := tools.NewWebSearchTool(cfg.Tools.Web.Search, cfg.Tools.Web); wsTool != nil {
 		registry.Register(wsTool)
@@ -173,7 +194,9 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 
 	var mem *memory.Store
 	if ws != "" && cfg.Tools.AgentMemory {
-		mem = memory.NewStore(ws)
+		mem = memory.NewStore(ws, cfg.Agents.Defaults.MaxMemoryInjectChars)
+		registry.Register(&tools.MemorySearchTool{Store: mem})
+		registry.Register(&tools.MemoryGetTool{Store: mem})
 	}
 
 	var selfImproving *memory.SelfImprovingStore
@@ -194,6 +217,12 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 
 	registry.Register(&tools.CronTool{Service: nil})
 
+	registry.Register(&tools.MQTTTool{
+		Workspace: ws,
+		LogDir:    ws,
+		Logger:    logger,
+	})
+
 	a := &AgentLoop{
 		Config:             cfg,
 		Provider:           provider,
@@ -206,6 +235,7 @@ func New(cfg config.Config, provider openaiapi.ChatClient, sessions *session.Man
 		SelfImproving:      selfImproving,
 		consolidationLocks: make(map[string]*consolidationLockEntry),
 		terminalPasswords:  make(map[string]map[string]string),
+		activeTerminals:    make(map[string]string),
 	}
 	if cfg.Agents.SubAgents.Enabled {
 		max := cfg.Agents.SubAgents.MaxConcurrent
@@ -370,14 +400,22 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	}
 
 	// Handle slash commands
-	trimmed := strings.TrimSpace(message)
+	trimmed := normalizeSlashCommand(message)
 	if strings.HasPrefix(trimmed, "/") {
 		resp, handled, execPrompt := a.handleSlashCommand(ctx, trimmed, sessionKey, channel, chatID)
 		if handled && execPrompt == "" {
+			if a.OnTerminalResolved != nil {
+				s, _ := a.Sessions.GetOrCreate(sessionKey)
+				st := a.loadTerminalState(s)
+				termCtx, _, _, _ := a.activeTerminalContext(sessionKey, st)
+				a.OnTerminalResolved(channel, chatID, formatTerminalLabel(termCtx))
+			}
 			return resp, false, nil
 		}
 		if execPrompt != "" {
 			message = execPrompt
+		} else if !handled {
+			return "Error: unknown slash command. Use /help.", false, nil
 		}
 	}
 	if strings.HasPrefix(trimmed, "/plan") {
@@ -390,7 +428,11 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	}
 	st := a.loadTerminalState(s)
 	var remoteBins []string
-	termCtx, remoteBins, _ := a.activeTerminalContext(sessionKey, st)
+	termCtx, remoteBins, _, termErr := a.activeTerminalContext(sessionKey, st)
+	if termErr != nil {
+		termCtx = nil
+		remoteBins = nil
+	}
 	if termCtx != nil {
 		ctx = tools.WithTerminalContext(ctx, termCtx)
 	}
@@ -416,11 +458,24 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 		}
 	}
 	// Token Budget Scheduler: use compact context for simple tasks to save tokens
-	maxMessages := a.Config.Agents.Defaults.MaxMessages
-	if maxMessages <= 0 {
-		maxMessages = 500
+	stmCfg := a.Config.Agents.Defaults.ShortTermMemory
+	if stmCfg == nil {
+		stmCfg = &config.ShortTermMemoryConfig{
+			RecentTokenBudget:       4000,
+			MiddleSummaryMaxChars:   2000,
+			EnableMiddleCompression: true,
+		}
 	}
-	history := a.Sessions.GetHistoryAligned(s, maxMessages)
+
+	// Build tiered history: recent full messages + middle compression
+	tiered := a.Sessions.GetTieredHistoryByTokens(
+		s,
+		stmCfg.RecentTokenBudget,
+		stmCfg.MiddleSummaryMaxChars,
+	)
+	history := tiered.RecentFull
+	middleNote := tiered.MiddleNote
+	historyTokens := tiered.RecentTokens
 	turnMode := false
 	if s.Metadata != nil {
 		if on, ok := s.Metadata["turn_mode"].(bool); ok && on {
@@ -510,6 +565,11 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 		}
 	}
 
+	// Inject middle layer summary into system prompt (key entities from compressed messages)
+	if middleNote != "" {
+		sysPrompt = sysPrompt + "\n\n" + middleNote
+	}
+
 	// Resolve model: context override > session override > default
 	resolvedModel := tools.ModelFromContext(ctx)
 	if resolvedModel == "" {
@@ -563,14 +623,19 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	}
 
 	unconsolidatedLen := len(s.Messages) - s.LastConsolidated
-	skippedCount := s.LastConsolidated + (unconsolidatedLen - len(history))
+	skippedMsgCount := s.LastConsolidated + (unconsolidatedLen - len(history))
+	totalUnconsolidatedTokens := utils.EstimateTokens(s.Messages[s.LastConsolidated:])
+	skippedTokens := totalUnconsolidatedTokens - historyTokens
 
 	// Log context length and compression status
 	if a.Logger != nil {
-		ctxInfo := fmt.Sprintf("[Context] session_msgs=%d unconsolidated=%d history_kept=%d max_messages=%d",
-			len(s.Messages), unconsolidatedLen, len(history), maxMessages)
-		if skippedCount > 0 {
-			ctxInfo += fmt.Sprintf(" | COMPRESSION: skipped=%d (truncated)", skippedCount)
+		ctxInfo := fmt.Sprintf("[Context] session_msgs=%d unconsolidated=%d history_kept=%d history_tokens=%d budget=%d",
+			len(s.Messages), unconsolidatedLen, len(history), historyTokens, stmCfg.RecentTokenBudget)
+		if middleNote != "" {
+			ctxInfo += fmt.Sprintf(" | MIDDLE_LAYER: compressed %d msgs into summary", tiered.MiddleMsgCount)
+		}
+		if skippedMsgCount > 0 {
+			ctxInfo += fmt.Sprintf(" | SKIPPED: %d msgs (%d tokens)", skippedMsgCount, skippedTokens)
 			if a.Memory != nil && a.Memory.ReadLongTerm() != "" {
 				ctxInfo += " [long-term memory note injected]"
 			}
@@ -581,12 +646,17 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	// Inject a recovery note when messages were skipped.
 	// Merge into existing system message to avoid consecutive same-role messages;
 	// MiniMax API rejects with error 2013 "invalid chat setting" when multiple messages share the same role.
-	if skippedCount > 0 {
+	if skippedMsgCount > 0 {
 		var note string
-		if a.Memory != nil {
-			note = a.Memory.BuildOverflowNote(skippedCount)
+		if middleNote != "" {
+			note = fmt.Sprintf("[Context: %d earlier messages (%d tokens) were compressed into the summary above.]",
+				skippedMsgCount, skippedTokens)
+		} else if a.Memory != nil && a.Memory.ReadLongTerm() != "" {
+			note = fmt.Sprintf("[Context: %d earlier messages (%d tokens) consolidated. Key info in Long-term Memory above.]",
+				skippedMsgCount, skippedTokens)
 		} else {
-			note = fmt.Sprintf("[Context: %d earlier messages were truncated due to context length limits.]", skippedCount)
+			note = fmt.Sprintf("[Context: %d earlier messages (%d tokens) were truncated due to context limits.]",
+				skippedMsgCount, skippedTokens)
 		}
 		if len(msgs) > 0 && msgs[len(msgs)-1].Role == "system" {
 			last := &msgs[len(msgs)-1]
@@ -662,9 +732,16 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	} else {
 		userMsg = openaiapi.Message{Role: "user", Content: userContent}
 	}
-	msgs = append(msgs, userMsg)
+
+	// Inject run_mode metadata for TUI display purposes
+	if mode := tools.RunModeFromContext(ctx); mode != "" {
+		userMsg.RunMode = string(mode)
+	}
+	userMsg.RequestRaw = message
 
 	historyStart := len(msgs) // index of the first new message in this turn
+
+	msgs = append(msgs, userMsg)
 
 	if a.Logger != nil {
 		a.Logger.Info(fmt.Sprintf("New user message: %s", message))
@@ -818,7 +895,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 					earlyResults[tc.ID] = ch
 					earlyMu.Unlock()
 					go func() {
-						r, e := a.Tools.ExecuteJSON(ctx, tc.Function.Name, tc.Function.Arguments)
+						r, e := a.executeToolCall(ctx, sessionKey, st, rawMessage, tc)
 						ch <- earlyToolResult{result: r, err: e}
 						close(ch)
 					}()
@@ -891,7 +968,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 							delete(earlyResults, tc.ID)
 							earlyMu.Unlock()
 						} else {
-							results[j], execErrs[j] = a.Tools.ExecuteJSON(ctx, tc.Function.Name, tc.Function.Arguments)
+							results[j], execErrs[j] = a.executeToolCall(ctx, sessionKey, st, rawMessage, tc)
 						}
 						elapsedMs[j] = time.Since(start).Milliseconds()
 					}(j, tc)
@@ -926,7 +1003,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 						delete(earlyResults, tc.ID)
 						earlyMu.Unlock()
 					} else {
-						result, execErr = a.Tools.ExecuteJSON(ctx, tc.Function.Name, tc.Function.Arguments)
+						result, execErr = a.executeToolCall(ctx, sessionKey, st, rawMessage, tc)
 					}
 					elapsedMs[j] = time.Since(start).Milliseconds()
 				}
@@ -1091,7 +1168,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 
 	if a.Logger != nil {
 		a.Logger.Info(fmt.Sprintf("[Token] TURN TOTAL: prompt=%d completion=%d total=%d | context_compression_triggered=%v",
-			totalUsage.PromptTokens, totalUsage.CompletionTokens, totalUsage.TotalTokens, skippedCount > 0))
+			totalUsage.PromptTokens, totalUsage.CompletionTokens, totalUsage.TotalTokens, skippedMsgCount > 0))
 	}
 	if a.OnTurnComplete != nil {
 		a.OnTurnComplete(channel, chatID, resolvedModel, totalUsage.PromptTokens, totalUsage.CompletionTokens, totalUsage.TotalTokens)
@@ -1100,7 +1177,81 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	return final, streamed, nil
 }
 
+func normalizeSlashCommand(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		lines := strings.Split(s, "\n")
+		if len(lines) >= 3 && strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "```") {
+			inner := strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
+			for _, prefix := range []string{"/", "／", "⁄", "∕"} {
+				if strings.HasPrefix(inner, prefix) {
+					return normalizeSlashCommand(inner)
+				}
+			}
+		}
+	}
+	for _, prefix := range []string{"／", "⁄", "∕"} {
+		if strings.HasPrefix(s, prefix) {
+			return "/" + strings.TrimPrefix(s, prefix)
+		}
+	}
+	return s
+}
+
+func terminalNameFromToolArgs(argsJSON string) string {
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return ""
+	}
+	for _, k := range []string{"terminal", "terminal_name", "terminalName"} {
+		if v, ok := args[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func inferTerminalNameFromText(text string, st terminalState) string {
+	text = strings.ToLower(text)
+	best := ""
+	for name := range st.Terminals {
+		n := strings.TrimSpace(name)
+		if n == "" {
+			continue
+		}
+		if strings.Contains(text, strings.ToLower(n)) {
+			if len(n) > len(best) {
+				best = n
+			}
+		}
+	}
+	return best
+}
+
+func (a *AgentLoop) executeToolCall(ctx context.Context, sessionKey string, st terminalState, rawMessage string, tc openaiapi.ToolCall) (string, error) {
+	if tc.Function.Name == "terminal_transfer" && tools.TerminalFromContext(ctx) == nil {
+		termName := terminalNameFromToolArgs(tc.Function.Arguments)
+		if termName == "" {
+			termName = inferTerminalNameFromText(rawMessage, st)
+		}
+		if termName == "" {
+			termName = strings.TrimSpace(st.Active)
+		}
+		if termName != "" {
+			termCtx, _, _, err := a.terminalContextForName(sessionKey, st, termName)
+			if err != nil {
+				return "", fmt.Errorf("resolve terminal %q: %w", termName, err)
+			}
+			if termCtx != nil {
+				ctx = tools.WithTerminalContext(ctx, termCtx)
+			}
+		}
+	}
+	return a.Tools.ExecuteJSON(ctx, tc.Function.Name, tc.Function.Arguments)
+}
+
 func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionKey string, channel string, chatID string) (string, bool, string) {
+	cmd = normalizeSlashCommand(cmd)
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return "", false, ""
@@ -1113,6 +1264,17 @@ func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionK
 		return a.buildHelpMessage(channel), true, ""
 
 	case "/new":
+		s, err := a.Sessions.GetOrCreate(sessionKey)
+		if err != nil {
+			return "Error: " + err.Error(), true, ""
+		}
+		a.Sessions.ClearSession(s)
+		_ = a.Sessions.Save(s)
+		a.Sessions.Invalidate(sessionKey)
+		a.removeConsolidationLock(sessionKey)
+		return "New session created.", true, ""
+
+	case "/compact":
 		s, err := a.Sessions.GetOrCreate(sessionKey)
 		if err != nil {
 			return "Error: " + err.Error(), true, ""
@@ -1230,6 +1392,12 @@ func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionK
 	case "/turn":
 		return a.handleTurnCommand(ctx, sessionKey, parts[1:])
 
+	case "/modbus":
+		return a.handleWithUnified(&command.ModbusHandler{}, ctx, sessionKey, channel, chatID, parts[1:])
+
+	case "/mqtt":
+		return a.handleWithUnified(&command.MQTTHandler{}, ctx, sessionKey, channel, chatID, parts[1:])
+
 	case "/stop":
 		return "Processing stopped.", true, ""
 
@@ -1247,17 +1415,14 @@ func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionK
 		execPrompt := planModePrompt + "\n\n" + task
 		return "", false, execPrompt
 
-	case "/model":
-		return a.handleModelCommand(ctx, sessionKey, parts[1:])
-
 	case "/models":
-		return a.handleModelsListCommand(), true, ""
+		return a.handleModelsCommand(ctx, sessionKey, parts[1:])
 
 	case "/skill":
 		return a.handleSkillCommand(ctx, sessionKey, parts[1:])
 
 	case "/terminal":
-		return a.handleTerminalCommand(ctx, sessionKey, parts[1:])
+		return a.handleWithUnified(&command.TerminalHandler{}, ctx, sessionKey, channel, chatID, parts[1:])
 
 	case "/subagents":
 		if handled, content := a.handleSubagentsCmd(ctx, cmd, sessionKey, channel, chatID, a.Bus); handled {
@@ -1267,6 +1432,9 @@ func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionK
 
 	case "/mcp":
 		return a.handleMCPCommand(), true, ""
+
+	case "/service":
+		return a.handleWithUnified(&command.ServiceHandler{}, ctx, sessionKey, channel, chatID, parts[1:])
 
 	default:
 		// Check custom slash commands from config
@@ -1282,37 +1450,54 @@ func (a *AgentLoop) handleSlashCommand(ctx context.Context, cmd string, sessionK
 	}
 }
 
-func (a *AgentLoop) handleModelCommand(ctx context.Context, sessionKey string, args []string) (string, bool, string) {
-	_ = ctx
-	s, err := a.Sessions.GetOrCreate(sessionKey)
+func (a *AgentLoop) handleModelsCommand(ctx context.Context, sessionKey string, args []string) (string, bool, string) {
+	// Use unified command handler
+	handler := &command.ModelsHandler{}
+	input := command.Input{
+		Args:       args,
+		Context:    ctx,
+		SessionKey: sessionKey,
+		Config:     &a.Config,
+		Sessions:   a.Sessions,
+	}
+
+	output, err := handler.Execute(input)
 	if err != nil {
 		return "Error: " + err.Error(), true, ""
 	}
-	if s.Metadata == nil {
-		s.Metadata = map[string]any{}
+	if output.Error != nil {
+		return "Error: " + output.Error.Error(), true, ""
 	}
 
-	// /model — show current
-	if len(args) == 0 {
-		current, _ := s.Metadata["model"].(string)
-		if current == "" {
-			current = a.Model
-		}
-		return fmt.Sprintf("**Current model:** %s\n(Use `/model <modelId>` to switch; `/new` resets to default.)", current), true, ""
+	return output.Content, output.IsFinal, output.ExecPrompt
+}
+
+// handleWithUnified executes a command using the unified handler
+func (a *AgentLoop) handleWithUnified(handler command.Handler, ctx context.Context, sessionKey, channel, chatID string, args []string) (string, bool, string) {
+	input := command.Input{
+		Args:       args,
+		Context:    ctx,
+		SessionKey: sessionKey,
+		Config:     &a.Config,
+		Sessions:   a.Sessions,
+		Channel:    channel,
+		ChatID:     chatID,
+		Tools:      a.Tools,
+		Agent:      a,
 	}
 
-	// /model <id> — set session override
-	target := strings.TrimSpace(strings.Join(args, " "))
-	if target == "" {
-		return "Usage: /model <modelId>", true, ""
+	output, err := handler.Execute(input)
+	if err != nil {
+		return "Error: " + err.Error(), true, ""
 	}
-	selected := a.Config.SelectProvider(target)
-	if selected == nil || selected.APIKey == "" {
-		return fmt.Sprintf("Error: No provider configured for model %q. Use /models to see available models.", target), true, ""
+	if output.Error != nil {
+		return "Error: " + output.Error.Error(), true, ""
 	}
-	s.Metadata["model"] = target
-	_ = a.Sessions.Save(s)
-	return fmt.Sprintf("Switched to **%s** for this session.", target), true, ""
+	if strings.TrimSpace(output.ExecPrompt) == "" && !output.IsFinal {
+		output.IsFinal = true
+	}
+
+	return output.Content, output.IsFinal, output.ExecPrompt
 }
 
 func (a *AgentLoop) handleLuckCommand(ctx context.Context, sessionKey string, args []string) (string, bool, string) {
@@ -1719,7 +1904,9 @@ func (a *AgentLoop) handleSkillCommand(ctx context.Context, sessionKey string, a
 				return fmt.Sprintf("Skill %q is unavailable (missing deps). Use read_file to check %s for requirements.", s.Name, s.Path), true, ""
 			}
 			if hasActiveTerm && strings.EqualFold(strings.TrimSpace(activeTerm.Type), "ssh") && strings.TrimSpace(activeTerm.SSH.Host) != "" {
-				activeTerm.SSH = a.resolveSSHConn(sessionKey, activeTermName, activeTerm.SSH)
+				if resolved, err := a.resolveSSHConn(sessionKey, activeTermName, activeTerm.SSH); err == nil {
+					activeTerm.SSH = resolved
+				}
 				out, updatedTerm, err := a.runRemoteSkill(ctx, sessionKey, channel, chatID, activeTermName, activeTerm, s, args)
 				if err != nil {
 					return "Error: " + err.Error() + "\n" + strings.TrimSpace(out), true, ""
@@ -1785,51 +1972,24 @@ func (a *AgentLoop) handleMCPCommand() string {
 	return b.String()
 }
 
-func (a *AgentLoop) handleModelsListCommand() string {
-	result := a.Config.ListAvailableModels()
-	if len(result.FetchErrors) > 0 {
-		var b strings.Builder
-		b.WriteString("**API fetch failed (no fallback):**\n")
-		for _, e := range result.FetchErrors {
-			b.WriteString("  • " + e + "\n")
-		}
-		b.WriteString("\nCheck apiBase and API key in config. ")
-		if len(result.Models) > 0 {
-			b.WriteString("Some providers succeeded:\n")
-			for _, m := range result.Models {
-				b.WriteString("  • " + m + "\n")
-			}
-		}
-		b.WriteString("\nUse `/model <modelId>` to switch for this session.")
-		return b.String()
-	}
-	if len(result.Models) == 0 {
-		return "No models available. Configure API keys and apiBase in ~/.luckclaw/config.json."
-	}
-	var b strings.Builder
-	b.WriteString("**Available models:**\n")
-	for _, m := range result.Models {
-		b.WriteString("  • " + m + "\n")
-	}
-	b.WriteString("\nUse `/model <modelId>` to switch for this session.")
-	return b.String()
-}
-
 func (a *AgentLoop) buildHelpMessage(channel string) string {
 	lines := []string{
 		"Available commands:",
-		"  /new     - Start a new conversation (consolidates memory first)",
+		"  /new     - Start a new conversation",
+		"  /compact - Consolidate memory and start a new conversation",
 		"  /reset   - Clear conversation without memory consolidation",
 		"  /verbose - Toggle verbose mode; /verbose on | off to set explicitly",
 		"  /terminal - Manage and switch remote terminal control",
-		"  /model   - Show or switch model; /model <id> to switch",
-		"  /models  - List available models",
+		"  /models  - List available models or switch model: /models <id>",
 		"  /plan    - Plan first, then execute: /plan <task>",
 		"  /skill   - List skills; /skill <name> to run a skill",
 		"  /summary - Generate a summary of the current conversation",
 		"  /luck    - Record last completed task as lucky; /luck last to preview; /luck list to show events",
 		"  /badluck - Record last completed task as bad luck; /badluck last to preview; /badluck list to show events",
 		"  /turn    - Temporary perspective shift; /turn reroll | status | on | off | save | clear",
+		"  /modbus  - Manage per-workspace Modbus devices; /modbus set | use | show | rm | template",
+		"  /mqtt    - Manage MQTT connections: /mqtt list | connect | disconnect | publish | subscribe | logs | rm",
+		"  /service - Manage services: /service list | add | rm | info | start | stop | search",
 		"  /help    - Show this help message",
 		"  /simple  - Control simple mode: /simple on | off | auto (compact context saves tokens)",
 		"  /stop    - Cancel current processing",
@@ -2037,13 +2197,22 @@ func (a *AgentLoop) maybeConsolidate(ctx context.Context, s *session.Session) {
 	if a.Memory == nil || a.Provider == nil {
 		return
 	}
-	window := a.Config.Agents.Defaults.MemoryWindow
-	if window <= 0 {
-		window = 20
+
+	threshold := memory.ConsolidationThreshold{
+		MessageCount: a.Config.Agents.Defaults.MemoryWindow,
+		TokenCount:   a.Config.Agents.Defaults.MemoryWindowTokens,
 	}
-	unconsolidated := a.Sessions.UnconsolidatedCount(s)
-	if unconsolidated < window {
+	if threshold.MessageCount <= 0 {
+		threshold.MessageCount = 20
+	}
+
+	shouldConsolidate, reason := a.Memory.ShouldConsolidate(s, threshold)
+	if !shouldConsolidate {
 		return
+	}
+
+	if a.Logger != nil {
+		a.Logger.Info(fmt.Sprintf("[Memory] Consolidation triggered: %s", reason))
 	}
 
 	lock := a.consolidationLockFor(s.Key)
@@ -2055,7 +2224,7 @@ func (a *AgentLoop) maybeConsolidate(ctx context.Context, s *session.Session) {
 		defer lock.Unlock()
 		bgCtx := context.Background()
 		timeout := a.consolidationTimeout()
-		ok, err := a.Memory.ConsolidateWithTimeout(bgCtx, s, a.Provider, a.Config.ModelIDForAPI(a.Model), false, window, timeout)
+		ok, err := a.Memory.ConsolidateWithTimeout(bgCtx, s, a.Provider, a.Config.ModelIDForAPI(a.Model), false, threshold.MessageCount, timeout)
 		if err != nil && a.Logger != nil {
 			a.Logger.Error(fmt.Sprintf("Memory consolidation failed (timeout=%v): %v", timeout, err))
 		}
@@ -2116,17 +2285,28 @@ func (a *AgentLoop) saveTurn(s *session.Session, msgs []openaiapi.Message, skip 
 			}
 
 		case "user":
-			content := msgContentString(m.Content)
-			if strings.HasPrefix(content, runtimeContextTag) {
-				parts := strings.SplitN(content, "\n\n", 2)
-				if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-					content = parts[1]
-				} else {
-					continue
+			// First check for RequestRaw which is the untouched original input
+			if m.RequestRaw != "" {
+				content := stripBase64Images(m.RequestRaw)
+				entry["content"] = content
+			} else {
+				content := msgContentString(m.Content)
+				if strings.HasPrefix(content, runtimeContextTag) {
+					parts := strings.SplitN(content, "\n\n", 2)
+					if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+						content = parts[1]
+					} else {
+						// Don't continue/skip here, just use the empty content or the whole thing
+						// so we don't drop the user's message entirely if they only sent context.
+						content = ""
+					}
 				}
+				content = stripBase64Images(content)
+				entry["content"] = content
 			}
-			content = stripBase64Images(content)
-			entry["content"] = content
+			if m.RunMode != "" {
+				entry["run_mode"] = m.RunMode
+			}
 		}
 
 		s.Messages = append(s.Messages, entry)
@@ -2428,4 +2608,209 @@ func toolArgsSummary(name string, argsJSON string) string {
 		summary = summary[:97] + "..."
 	}
 	return summary
+}
+
+func (a *AgentLoop) handleServiceCommand(ctx context.Context, sessionKey string, args []string) (string, bool, string) {
+	_ = ctx
+	reg := service.GlobalRegistry()
+	if err := reg.Load(); err != nil {
+		return "Error: failed to load service registry: " + err.Error(), true, ""
+	}
+
+	sub := ""
+	if len(args) > 0 {
+		sub = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+
+	switch sub {
+	case "", "list", "status":
+		var b strings.Builder
+		services := reg.List()
+		if len(services) == 0 {
+			b.WriteString("No services registered. Use web_design tool to create services, or run `/service add web_design` to create one.\n")
+		} else {
+			b.WriteString(fmt.Sprintf("**Services (%d):**\n\n", len(services)))
+			for _, s := range services {
+				status := "stopped"
+				if s.Running {
+					status = fmt.Sprintf("running (: %d)", s.Port)
+				}
+				line := fmt.Sprintf("- **%s** (%s) %s", s.ID, s.Type, status)
+				if s.Name != "" && s.Name != s.ID {
+					line += fmt.Sprintf(" — %s", s.Name)
+				}
+				b.WriteString(line + "\n")
+				if s.Running && s.Port > 0 {
+					b.WriteString(fmt.Sprintf("  URL: http://%s:%d/\n", s.Host, s.Port))
+				}
+			}
+		}
+
+		b.WriteString("\nUsage:\n")
+		b.WriteString("  /service list\n")
+		b.WriteString("  /service add <type>\n")
+		b.WriteString("  /service rm <id>\n")
+		b.WriteString("  /service info <id>\n")
+		b.WriteString("  /service start <id>\n")
+		b.WriteString("  /service stop <id>\n")
+		b.WriteString("  /service search [query]\n")
+		return strings.TrimRight(b.String(), "\n"), true, ""
+
+	case "info", "show":
+		if len(args) < 2 {
+			return "Usage: /service info <service_id>", true, ""
+		}
+		id := strings.TrimSpace(args[1])
+		svc, ok := reg.Get(id)
+		if !ok {
+			return fmt.Sprintf("Service not found: %s", id), true, ""
+		}
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("**Service: %s**\n\n", svc.ID))
+		b.WriteString(fmt.Sprintf("- Type: %s\n", svc.Type))
+		b.WriteString(fmt.Sprintf("- Name: %s\n", svc.Name))
+		if svc.Description != "" {
+			b.WriteString(fmt.Sprintf("- Description: %s\n", svc.Description))
+		}
+		b.WriteString(fmt.Sprintf("- Directory: %s\n", svc.Dir))
+		b.WriteString(fmt.Sprintf("- Host: %s\n", svc.Host))
+		b.WriteString(fmt.Sprintf("- Port: %d\n", svc.Port))
+		b.WriteString(fmt.Sprintf("- Running: %v\n", svc.Running))
+		b.WriteString(fmt.Sprintf("- AutoStart: %v\n", svc.AutoStart))
+		b.WriteString(fmt.Sprintf("- Created: %s\n", svc.CreatedAt))
+		if svc.Running && svc.Port > 0 {
+			b.WriteString(fmt.Sprintf("\n**URL:** http://%s:%d/\n", svc.Host, svc.Port))
+			b.WriteString(fmt.Sprintf("**WS:** ws://%s:%d/ws\n", svc.Host, svc.Port))
+		}
+		return b.String(), true, ""
+
+	case "start":
+		if len(args) < 2 {
+			return "Usage: /service start <service_id>", true, ""
+		}
+		id := strings.TrimSpace(args[1])
+		if _, ok := reg.Get(id); !ok {
+			return fmt.Sprintf("Service not found: %s", id), true, ""
+		}
+		if err := reg.StartService(ctx, id); err != nil {
+			return fmt.Sprintf("Error starting service: %v", err), true, ""
+		}
+		return fmt.Sprintf("**Service %s started.**", id), true, ""
+
+	case "stop":
+		if len(args) < 2 {
+			return "Usage: /service stop <service_id>", true, ""
+		}
+		id := strings.TrimSpace(args[1])
+		if _, ok := reg.Get(id); !ok {
+			return fmt.Sprintf("Service not found: %s", id), true, ""
+		}
+		if err := reg.StopService(id); err != nil {
+			return fmt.Sprintf("Error stopping service: %v", err), true, ""
+		}
+		return fmt.Sprintf("**Service %s stopped.**", id), true, ""
+
+	case "search":
+		query := strings.TrimSpace(strings.Join(args[1:], " "))
+		var services []*service.ServiceInfo
+		if query == "" {
+			services = reg.List()
+		} else {
+			services = reg.Search(query)
+		}
+		if len(services) == 0 {
+			if query == "" {
+				return "No services registered.", true, ""
+			}
+			return fmt.Sprintf("No services matching: %s", query), true, ""
+		}
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("**Found %d service(s):**\n\n", len(services)))
+		for _, s := range services {
+			status := "stopped"
+			if s.Running {
+				status = fmt.Sprintf("running (: %d)", s.Port)
+			}
+			b.WriteString(fmt.Sprintf("- **%s** (%s) %s — %s\n", s.ID, s.Type, status, s.Name))
+		}
+		return b.String(), true, ""
+
+	case "add", "create":
+		if len(args) < 2 {
+			return "Usage: /service add <type> [--title <title>] [--host <host>] [--port <port>]", true, ""
+		}
+		svcType := strings.ToLower(args[1])
+		if !service.GlobalTypeRegistry().HasType(svcType) {
+			return fmt.Sprintf("Unsupported service type: %s (registered: %v)", svcType, service.GlobalTypeRegistry().RegisteredTypes()), true, ""
+		}
+		title := "Web Design"
+		host := "127.0.0.1"
+		port := 0
+		for i := 2; i < len(args); i++ {
+			switch strings.ToLower(args[i]) {
+			case "--title":
+				if i+1 < len(args) {
+					title = args[i+1]
+					i++
+				}
+			case "--host":
+				if i+1 < len(args) {
+					host = args[i+1]
+					i++
+				}
+			case "--port":
+				if i+1 < len(args) {
+					if p, err := fmt.Sscanf(args[i+1], "%d", &port); err == nil && p > 0 {
+						i++
+					}
+				}
+			}
+		}
+		mgr := service.WebDesignManagerGlobal()
+		session, err := mgr.Create("", title, "", host, port, true, nil)
+		if err != nil {
+			return "Error creating service: " + err.Error(), true, ""
+		}
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("**Service %s created.**\n\n", session.ServiceID()))
+		if session.IsRunning() && session.Port > 0 {
+			b.WriteString(fmt.Sprintf("- Status: running\n"))
+			b.WriteString(fmt.Sprintf("- URL: http://%s:%d/\n", session.Host, session.Port))
+			b.WriteString(fmt.Sprintf("- WS: ws://%s:%d/ws\n", session.Host, session.Port))
+		} else {
+			b.WriteString(fmt.Sprintf("- Status: stopped\n"))
+			b.WriteString(fmt.Sprintf("- Directory: %s\n", session.Dir))
+		}
+		return b.String(), true, ""
+
+	case "rm", "delete":
+		if len(args) < 2 {
+			return "Usage: /service rm <id>", true, ""
+		}
+		id := strings.TrimSpace(args[1])
+		svc, ok := reg.Get(id)
+		if !ok {
+			return fmt.Sprintf("Service %s not found", id), true, ""
+		}
+		if svc.Running {
+			_ = reg.StopService(id)
+		}
+		// Clean up type-specific resources
+		if svc.Type == service.TypeWebDesign {
+			mgr := service.WebDesignManagerGlobal()
+			_ = mgr.Delete(id)
+		}
+		reg.Unregister(id)
+		return fmt.Sprintf("Service removed: %s", id), true, ""
+
+	default:
+		return "Usage: `/service [list|info <id>|start <id>|stop <id>|search [query]|add web_design|rm <id>]`\n\n" +
+			"- `/service list` — List all registered services\n" +
+			"- `/service info <id>` — Show service details\n" +
+			"- `/service start <id>` — Start a service\n" +
+			"- `/service stop <id>` — Stop a service\n" +
+			"- `/service search [query]` — Search services by name/type/description\n" +
+			"- `/service add web_design` — Create a new web_design service\n" +
+			"- `/service rm <id>` — Remove a service", true, ""
+	}
 }
