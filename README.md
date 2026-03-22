@@ -129,7 +129,10 @@ luckclaw is a lightweight personal AI assistant rebuilt in Golang based on [nano
 | `maxTokens`              | Max tokens                                                      | 8192                        |
 | `temperature`            | Temperature                                                     | 0.1                         |
 | `maxToolIterations`      | Max tool iterations                                             | 40                          |
-| `memoryWindow`           | Memory window                                                   | 20                          |
+| `memoryWindow`           | Message count threshold for memory window (fallback)            | 20                          |
+| `memoryWindowTokens`     | Token threshold for memory window (preferred)                   | -                           |
+| `maxContextTokens`       | Total context token truncation threshold                        | -                           |
+| `maxMemoryInjectChars`   | Memory injection character limit                                | -                           |
 | `maxMessages`            | Max messages                                                    | 500                         |
 | `consolidationTimeout`   | Memory consolidation timeout (seconds)                          | 30                          |
 | `verboseDefault`         | Verbose by default                                              | true                        |
@@ -496,7 +499,8 @@ Connect to a streamable HTTP endpoint compliant with MCP 2025-03-26. Suitable fo
 
 ### 9.1 Discovery
 
-- **Directory**: `{workspace}/skills/{name}/SKILL.md`
+- **Local Directory**: `{workspace}/skills/{name}/SKILL.md`
+- **Remote Directory**: When a remote terminal is active, skills are also discovered from `~/.luckclaw/workspace/skills/` and `~/.luckclaw_remote/ws/{termName}/{sessionHash}/skills/` on the remote host.
 - **Frontmatter**: `description`, `metadata` (`luckclaw.requires.bins`, `luckclaw.requires.env`, `luckclaw.always`)
 
 ### 9.2 Notes

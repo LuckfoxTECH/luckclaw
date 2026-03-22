@@ -120,7 +120,10 @@ luckclaw 是一个基于 [nanobot](https://github.com/HKUDS/nanobot) 用 Golang 
 | `maxTokens`              | 最大 token               | 8192                        |
 | `temperature`            | 温度                     | 0.1                         |
 | `maxToolIterations`      | 工具迭代上限                 | 40                          |
-| `memoryWindow`           | 记忆窗口                   | 20                          |
+| `memoryWindow`           | 记忆窗口消息数阈值（fallback）      | 20                          |
+| `memoryWindowTokens`     | 记忆窗口 Token 阈值（优先）       | -                           |
+| `maxContextTokens`       | 上下文总 Token 截断阈值         | -                           |
+| `maxMemoryInjectChars`   | 记忆注入字符上限               | -                           |
 | `maxMessages`            | 最大消息数                  | 500                         |
 | `consolidationTimeout`   | 记忆整合超时（秒）              | 30                          |
 | `verboseDefault`         | 默认详细模式                 | true                        |
@@ -486,7 +489,8 @@ luckclaw 是一个基于 [nanobot](https://github.com/HKUDS/nanobot) 用 Golang 
 
 ### 9.1 发现方式
 
-- **目录**：`{workspace}/skills/{name}/SKILL.md`
+- **本地目录**：`{workspace}/skills/{name}/SKILL.md`
+- **远端目录**：当远程终端处于激活状态时，还会从远端主机的 `~/.luckclaw/workspace/skills/` 和 `~/.luckclaw_remote/ws/{termName}/{sessionHash}/skills/` 发现 Skills。
 - **Frontmatter**：`description`、`metadata`（`luckclaw.requires.bins`、`luckclaw.requires.env`、`luckclaw.always`）
 
 ### 9.2 配置说明
