@@ -169,14 +169,15 @@ func getSlashCommands(cfg config.Config) []slashCommand {
 		{"/luck", "Record last completed task as lucky; /luck last to preview; /luck list to show events"},
 		{"/badluck", "Record last completed task as bad luck; /badluck last to preview; /badluck list to show events"},
 		{"/turn", "Temporary perspective shift; /turn reroll | status | on | off | save | clear"},
-		{"/modbus", "Manage per-workspace Modbus devices and config: list, add, info, rm, use, off"},
-		{"/mqtt", "Manage MQTT connections: list, add, connect, disconnect, info, rm, logs"},
+		{"/modbus", "Manage per-workspace Modbus devices and config: /modbus list | add | info | rm | use | off"},
+		{"/mqtt", "Manage MQTT connections: /mqtt list | add | connect | disconnect | info | rm | logs"},
 		{"/stop", "Cancel current processing"},
 		{"/sessions", "Manage and switch between sessions"},
 		{"/heartbeat", "Show heartbeat status (gateway only)"},
 		{"/mcp", "List connected MCP tools"},
 		{"/subagents", "List/kill/info/spawn subagent runs"},
 		{"/service", "Manage services: /service list | add | rm | info | start | stop | search"},
+		{"/theme", "Switch theme: /theme mocha | macchiato | frappe | latte"},
 	}
 	if cfg.SlashCommands != nil {
 		for name, c := range cfg.SlashCommands {
@@ -293,10 +294,28 @@ func NewCmd() *cobra.Command {
 				status.SetContextMode(mode)
 			}
 
+			// Set MQTT OnTopicMessage callback for TUI display
+			if mqttTool := loop.Tools.Get("mqtt"); mqttTool != nil {
+				if mt, ok := mqttTool.(*tools.MQTTTool); ok {
+					mt.OnTopicMessage = func(clientID, topic, payload string) {
+						msg := fmt.Sprintf("[MQTT] %s | %s | %s", clientID, topic, payload)
+						_ = tuiBus.PublishOutbound(context.Background(), bus.OutboundMessage{
+							Channel: "tui",
+							ChatID:  "main",
+							Content: msg,
+							Type:    "mqtt",
+						})
+					}
+				}
+			}
+
 			thinkingText := ""
 			if ux := (&cfg).UXPtr(); ux != nil && (ux.Typing || ux.Placeholder.Enabled) && ux.Placeholder.Text != "" {
 				thinkingText = ux.Placeholder.Text
 			}
+			// Default theme is Mocha (dark)
+			defaultTheme := ThemeMocha
+			defaultStyles := NewStyles(defaultTheme)
 			prog := &tuiProgram{
 				status:        status,
 				loop:          loop,
@@ -309,6 +328,9 @@ func NewCmd() *cobra.Command {
 				thinkingText:  thinkingText,
 				renamingIdx:   -1,
 				mouseEnabled:  true,
+				selection:     NewSelection(),
+				theme:         defaultTheme,
+				styles:        defaultStyles,
 			}
 			p := tea.NewProgram(prog, tea.WithMouseCellMotion())
 			go func() {
@@ -358,6 +380,10 @@ type tuiProgram struct {
 	thinkingText string
 	mouseEnabled bool
 
+	// Text selection
+	selection         *Selection
+	plainContentLines []string // Plain text content line cache (for selection, without ANSI sequences)
+
 	// Sessions management
 	showSessions  bool
 	sessionList   []sessionpkg.SessionInfo
@@ -365,6 +391,10 @@ type tuiProgram struct {
 	sessionScroll int
 	renamingIdx   int // -1 if not renaming
 	renameInput   string
+
+	// Theme
+	theme  Theme
+	styles Styles
 }
 
 type (
@@ -447,16 +477,84 @@ func (p *tuiProgram) historyDown() bool {
 
 // contentLineCount returns (totalLines, contentHeight) for scroll clamping.
 func (p *tuiProgram) contentLineCount() (int, int) {
-	contentHeight := p.height - 5 // TopBar(1) + Header(1) + Input(1) + Status(1) + Footer(1)
-	if len(p.filteredCompletions()) > 0 {
-		contentHeight = p.height - 7 // Including completions block (approx)
-	}
-	if contentHeight < 3 {
-		contentHeight = 16
-	}
 	content := p.buildContentString()
 	lines := strings.Split(content, "\n")
-	return len(lines), contentHeight
+	width := p.width
+	if width <= 0 {
+		width = 80
+	}
+	return len(lines), p.contentAreaHeight(width)
+}
+
+func (p *tuiProgram) contentTopOffset(width int) int {
+	topBar := p.styles.TopBarStyle(width).Render("")
+	header := p.styles.HeaderStyle(width).Render("")
+	return lipgloss.Height(topBar) + lipgloss.Height(header)
+}
+
+func (p *tuiProgram) contentAreaHeight(width int) int {
+	status, _, _, model, _, _, _, _, _, _, _, _ := p.status.Get()
+	isRunning := status == "running" || status == "thinking"
+	isStop := status == "stop"
+	isPlan := p.runMode == tools.RunModePlan
+
+	accentColor := p.theme.StatusIdle
+	if isPlan {
+		accentColor = p.theme.StatusPlan
+	}
+	if isRunning {
+		accentColor = p.theme.StatusRunning
+	} else if isStop {
+		accentColor = p.theme.StatusStop
+	}
+
+	inputStyle := p.styles.InputStyle(width, accentColor)
+	innerWidth := width - inputStyle.GetHorizontalFrameSize()
+	inputLine := inputStyle.Render(renderSingleLineInput(p.input, p.inputPos, innerWidth))
+	statusBar := p.styles.StatusBarStyle(isRunning, isStop, isPlan).Width(width).Render(model)
+	footer := p.styles.Footer.Render("Type /help for commands. | Tab: toggle plan/build")
+
+	completionHeight := 0
+	filtered := p.filteredCompletions()
+	if len(filtered) > 0 {
+		maxShow := 6
+		startC := p.completionIndex - maxShow/2
+		if startC < 0 {
+			startC = 0
+		}
+		endC := startC + maxShow
+		if endC > len(filtered) {
+			endC = len(filtered)
+			startC = endC - maxShow
+			if startC < 0 {
+				startC = 0
+			}
+		}
+		slice := filtered[startC:endC]
+		var cLines []string
+		for i, c := range slice {
+			idx := startC + i
+			arrow := "  "
+			if idx == p.completionIndex {
+				arrow = "→ "
+			}
+			line := fmt.Sprintf("%s%s  %s", arrow, c.Name, c.Desc)
+			if idx == p.completionIndex {
+				line = p.styles.SelectedCompletionStyle().Render(line)
+			}
+			cLines = append(cLines, line)
+		}
+		completionBlock := p.styles.CompletionStyle(width).
+			Render(strings.Join(cLines, "\n") + fmt.Sprintf("\n  (%d/%d)", p.completionIndex+1, len(filtered)))
+		completionHeight = lipgloss.Height(completionBlock)
+	}
+
+	fixedHeight := p.contentTopOffset(width) + lipgloss.Height(inputLine) + lipgloss.Height(statusBar) + lipgloss.Height(footer)
+	contentHeight := p.height - fixedHeight - completionHeight
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+	return contentHeight
 }
 
 func (p *tuiProgram) scrollMax(totalLines, contentHeight int) int {
@@ -484,48 +582,58 @@ func (p *tuiProgram) buildContentString() string {
 	if width <= 0 {
 		width = 80
 	}
-	assistantStyle := lipgloss.NewStyle().Width(width)
+	t := p.theme
+	assistantStyle := lipgloss.NewStyle().Foreground(t.Text).Width(width)
 	var contentBlocks []string
+	var plainBlocks []string // Plain text blocks (for selection)
+
 	for _, msg := range p.messages {
 		if msg.role == "user" {
-			wrapped := wordWrapANSI(msg.content, width-4)
-			// Apply user background and border color dynamically based on runMode when sent
-			accentColor := lipgloss.Color("62") // default Build mode border color
-			if msg.runMode == tools.RunModePlan {
-				accentColor = lipgloss.Color("39") // Plan mode border color
+			userStyle := p.styles.UserMessageStyle(string(msg.runMode))
+			userInnerWidth := width - userStyle.GetHorizontalFrameSize()
+			if userInnerWidth < 1 {
+				userInnerWidth = 1
 			}
-			userStyle := lipgloss.NewStyle().
-				Foreground(lipgloss.Color("252")). // Ensure text is visible
-				Padding(0, 1).
-				Border(lipgloss.Border{
-					Left: "┃",
-				}, false, false, false, true).
-				BorderForeground(accentColor).
-				Width(width)
+			wrapped := wordWrapANSI(msg.content, userInnerWidth)
 
-			contentBlocks = append(contentBlocks, userStyle.Render(wrapped))
+			contentBlocks = append(contentBlocks, userStyle.Width(userInnerWidth).Render(wrapped))
+			plainBlocks = append(plainBlocks, wordWrapANSI("┃ "+msg.content, width))
+		} else if msg.role == "mqtt" {
+			// MQTT messages with teal border
+			mqttStyle := p.styles.MQTTMessageStyle(width)
+			wrapped := wordWrapANSI(msg.content, width-4)
+			contentBlocks = append(contentBlocks, mqttStyle.Render(wrapped))
+			plainBlocks = append(plainBlocks, wordWrapANSI("┃ "+msg.content, width))
 		} else {
 			rendered := p.renderMarkdown(msg.content)
 			contentBlocks = append(contentBlocks, assistantStyle.Render(rendered))
+			// Assistant message plain text also needs wrapping
+			plainBlocks = append(plainBlocks, wordWrapANSI(msg.content, width))
 		}
 	}
 	content := strings.Join(contentBlocks, "\n\n")
+	plainContent := strings.Join(plainBlocks, "\n\n")
+
 	st, _, _, _, _, _, _, _, _, _, _, _ := p.status.Get()
 	isRunning := st == "running" || st == "thinking"
 	if isRunning {
 		if p.progressContent != "" {
-			thinkingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
-			content += "\n\n" + thinkingStyle.Render(wordWrapANSI(p.progressContent, width))
+			progressStyle := p.styles.ProgressStyle()
+			content += "\n\n" + progressStyle.Render(wordWrapANSI(p.progressContent, width))
+			plainContent += "\n\n" + wordWrapANSI(p.progressContent, width)
 		} else {
 			anim := loadingFrames[p.animFrame%len(loadingFrames)]
 			thinkingText := p.thinkingText
 			if thinkingText == "" {
 				thinkingText = "thinking..."
 			}
-			thinkingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("109")).Italic(true)
+			thinkingStyle := p.styles.ThinkingStyle()
 			content += "\n\n" + thinkingStyle.Render(anim+" "+thinkingText)
+			plainContent += "\n\n" + wordWrapANSI(anim+" "+thinkingText, width)
 		}
 	}
+	// Update plain text content line cache (for text selection)
+	p.plainContentLines = strings.Split(plainContent, "\n")
 	return content
 }
 
@@ -546,12 +654,34 @@ func (p *tuiProgram) handleSend(input string) tea.Cmd {
 	}
 	if trimmed == "/new" {
 		newSession := fmt.Sprintf("tui:%d", time.Now().Unix())
+		// Clear old session's activeTerminal state
+		p.loop.ClearActiveTerminal(p.session)
 		p.session = newSession
 		p.messages = []chatMessage{}
 		p.scrollOffset = 0
 		p.resetHistoryBrowsing()
 		p.addInputHistory(trimmed)
 		p.messages = append(p.messages, chatMessage{role: "assistant", content: "New session created."})
+		// Reset terminal state display to local
+		p.status.SetTerminal("local")
+		return nil
+	}
+	// Handle /theme command
+	if strings.HasPrefix(trimmed, "/theme") {
+		parts := strings.Fields(trimmed)
+		if len(parts) < 2 {
+			// Show current theme and available themes
+			available := strings.Join(ThemeNames(), ", ")
+			msg := fmt.Sprintf("Current theme: %s\nAvailable themes: %s\nUsage: /theme <name>", CurrentTheme.Name, available)
+			p.messages = append(p.messages, chatMessage{role: "assistant", content: msg})
+			return nil
+		}
+		themeName := parts[1]
+		newTheme := ThemeByName(themeName)
+		p.theme = newTheme
+		p.styles = NewStyles(newTheme)
+		CurrentTheme = newTheme
+		p.messages = append(p.messages, chatMessage{role: "assistant", content: fmt.Sprintf("Theme switched to: %s", newTheme.Name)})
 		return nil
 	}
 	return tea.Batch(
@@ -693,6 +823,7 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	switch m := msg.(type) {
 	case tea.MouseMsg:
+		// Scroll wheel event handling (preserve existing functionality)
 		if m.Button == tea.MouseButtonWheelUp {
 			if p.scrollOffset > 0 {
 				p.scrollOffset--
@@ -707,14 +838,111 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return p, nil
 		}
+
+		// Mouse left button press
+		if m.Action == tea.MouseActionPress && m.Button == tea.MouseButtonLeft {
+			width := p.width
+			if width <= 0 {
+				width = 80
+			}
+			contentY := m.Y + p.scrollOffset - p.contentTopOffset(width)
+			contentX := m.X
+			// Boundary check: ensure contentY is not negative
+			if contentY >= 0 {
+				p.selection.HandleMouseDown(contentX, contentY, p.plainContentLines)
+			}
+			return p, nil
+		}
+
+		// Mouse drag
+		if m.Action == tea.MouseActionMotion {
+			if p.selection.IsMouseDown() {
+				width := p.width
+				if width <= 0 {
+					width = 80
+				}
+				contentY := m.Y + p.scrollOffset - p.contentTopOffset(width)
+				contentX := m.X
+				// Boundary check: allow negative for extending selection to top
+				if contentY >= 0 {
+					p.selection.HandleMouseDrag(contentX, contentY)
+				}
+			}
+			return p, nil
+		}
+
+		// Mouse release
+		if m.Action == tea.MouseActionRelease && m.Button == tea.MouseButtonLeft {
+			width := p.width
+			if width <= 0 {
+				width = 80
+			}
+			contentY := m.Y + p.scrollOffset - p.contentTopOffset(width)
+			contentX := m.X
+
+			// Boundary check
+			if contentY >= 0 && p.selection.HandleMouseUp(contentX, contentY) {
+				selectedText := p.selection.GetSelectedText(p.plainContentLines)
+				if selectedText != "" {
+					// Directly copy the selected text. Since we now use uniseg grapheme clusters,
+					// the emojis are perfectly intact and won't contain fragmented ANSI codes.
+					CopyToClipboard(selectedText)
+				}
+			} else {
+				// Even if contentY < 0, call HandleMouseUp to reset mouseDown state
+				p.selection.HandleMouseUp(contentX, contentY)
+			}
+			return p, nil
+		}
+
 		return p, nil
 	case tea.KeyMsg:
 		filtered := p.filteredCompletions()
 		hasCompletions := len(filtered) > 0
 
 		switch m.String() {
-		case "ctrl+c", "ctrl+d":
+		case "ctrl+c":
+			if p.selection.HasSelection() {
+				selectedText := p.selection.GetSelectedText(p.plainContentLines)
+				if selectedText != "" {
+					// Directly copy the selected text. Since we now use uniseg grapheme clusters,
+					// the emojis are perfectly intact and won't contain fragmented ANSI codes.
+					CopyToClipboard(selectedText)
+				}
+				return p, nil
+			}
 			return p, tea.Quit
+		case "ctrl+d":
+			return p, tea.Quit
+		case "ctrl+t":
+			// Cycle through themes
+			themes := ThemeNames()
+			currentIdx := 0
+			for i, name := range themes {
+				if name == CurrentTheme.Name {
+					currentIdx = i
+					break
+				}
+			}
+			nextIdx := (currentIdx + 1) % len(themes)
+			newTheme := ThemeByName(themes[nextIdx])
+			p.theme = newTheme
+			p.styles = NewStyles(newTheme)
+			CurrentTheme = newTheme
+			p.messages = append(p.messages, chatMessage{role: "assistant", content: fmt.Sprintf("Theme: %s", newTheme.Name)})
+			return p, nil
+		case "esc":
+			// If selection exists, clear selection
+			if p.selection.HasSelection() {
+				p.selection.Clear()
+				return p, nil
+			}
+			// Otherwise return to session list or perform other actions
+			if p.showSessions {
+				p.showSessions = false
+				return p, nil
+			}
+			return p, nil
 		case "alt+m":
 			p.mouseEnabled = !p.mouseEnabled
 			if p.mouseEnabled {
@@ -920,6 +1148,11 @@ func (p *tuiProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case outboundMsg:
 		if m.Type == bus.MsgToolProgress {
 			p.progressContent = mergeProgressStep(p.progressContent, m.Content)
+		} else if m.Type == "mqtt" {
+			// MQTT messages always create new messages with special styling
+			p.messages = append(p.messages, chatMessage{role: "mqtt", content: m.Content})
+			totalLines, contentHeight := p.contentLineCount()
+			p.scrollOffset = p.scrollMax(totalLines, contentHeight) // Scroll to bottom
 		} else if m.Content != "" {
 			// Spawn callback (including **Status:** and runId) always creates a new message to avoid being overwritten by agentDoneMsg after being merged with the parent agent's streaming content.
 			isSpawnResult := strings.Contains(m.Content, "**Status:**") && strings.Contains(m.Content, "runId")
@@ -1047,10 +1280,7 @@ func (p *tuiProgram) viewSessions() string {
 
 	_, _, _, _, _, _, _, _, _, _, _, version := p.status.Get()
 	topBarText := fmt.Sprintf("🍀 luckclaw v%s | Sessions", version)
-	topBarStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252")).
-		Background(lipgloss.Color("234")).
-		Width(w)
+	topBarStyle := p.styles.TopBarStyle(w)
 	topBar := topBarStyle.Render(topBarText)
 
 	var listLines []string
@@ -1077,18 +1307,13 @@ func (p *tuiProgram) viewSessions() string {
 		}
 
 		line := fmt.Sprintf("%s %-20s | %s", cursor, displayKey, summary)
-		style := lipgloss.NewStyle().Padding(0, 1)
-		if i == p.sessionIdx {
-			style = style.Foreground(lipgloss.Color("255")).Background(lipgloss.Color("62")).Bold(true)
-		} else {
-			style = style.Foreground(lipgloss.Color("250"))
-		}
+		style := p.styles.SessionItemStyle(i == p.sessionIdx).Padding(0, 1)
 		listLines = append(listLines, style.Render(line))
 
 		if len(s.RecentMessages) > 0 && i == p.sessionIdx {
 			for _, msg := range s.RecentMessages {
 				msgStyle := lipgloss.NewStyle().
-					Foreground(lipgloss.Color("245")).
+					Foreground(p.theme.Subtext1).
 					Padding(0, 1).
 					PaddingLeft(4)
 				listLines = append(listLines, msgStyle.Render(msg))
@@ -1103,13 +1328,12 @@ func (p *tuiProgram) viewSessions() string {
 	content := strings.Join(listLines, "\n")
 	contentHeight = p.height - 4
 	mainContent := lipgloss.NewStyle().
-		Background(lipgloss.Color("0")).
+		Background(p.theme.Crust).
 		Width(w).
 		Height(contentHeight).
 		Render(content)
 
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).
-		Render("↑/↓: navigate | enter: switch | d: delete | r: rename | esc/q: back | history shown for selected")
+	footer := p.styles.Footer.Render("↑/↓: navigate | enter: switch | d: delete | r: rename | esc/q: back | history shown for selected")
 
 	return lipgloss.JoinVertical(lipgloss.Left, topBar, mainContent, footer)
 }
@@ -1132,45 +1356,29 @@ func (p *tuiProgram) View() string {
 		termPart = strings.TrimSpace(terminal)
 	}
 	topBarText := fmt.Sprintf("🍀 luckclaw v%s", version)
-	topBarStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252")).
-		Background(lipgloss.Color("234")). // Darker background to distinguish
-		BorderForeground(lipgloss.Color("240")).
-		Width(w)
+	topBarStyle := p.styles.TopBarStyle(w)
 	topBar := topBarStyle.Render(topBarText)
 
 	// Header: # session (left) | tokens / ctx (right)
 	// tokenStr := formatTokens(totalTok, ctxWindow)
-	ctxPart := ""
+	ctxPart := "󱃾 no-context"
 	if ctxSources != "" {
-		modeSuffix := ""
+		ctxPart = fmt.Sprintf("󱃾 %s", ctxSources)
 		if ctxMode != "" {
-			modeSuffix = fmt.Sprintf(" (%s)", ctxMode)
+			ctxPart = fmt.Sprintf("%s · %s", ctxPart, ctxMode)
 		}
-		ctxPart = fmt.Sprintf(" ctx: %s%s", ctxSources, modeSuffix)
 	}
 
-	headerLeft := fmt.Sprintf("# session: %s | term: %s", p.session, termPart)
-	// headerRight := fmt.Sprintf("tokens: %s%s", tokenStr, ctxPart)
-	headerRight := fmt.Sprintf("%s", ctxPart)
+	headerLeft := fmt.Sprintf("󰘬 %s   󰆍 %s", p.session, termPart)
+	headerRight := ctxPart
 
-	// Calculate space between left and right
+	headerStyle := p.styles.HeaderStyle(w)
 	leftWidth := lipgloss.Width(headerLeft)
 	rightWidth := lipgloss.Width(headerRight)
-	spaceWidth := w - leftWidth - rightWidth - 4 // 4 for padding/borders
+	spaceWidth := w - leftWidth - rightWidth - headerStyle.GetHorizontalFrameSize()
 	if spaceWidth < 1 {
 		spaceWidth = 1
 	}
-
-	headerStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252")).
-		Background(lipgloss.Color("234")).
-		Padding(0, 1).
-		Border(lipgloss.Border{
-			Left: "┃",
-		}, false, false, false, true).
-		BorderForeground(lipgloss.Color("240")).
-		Width(w)
 
 	headerContent := headerLeft + strings.Repeat(" ", spaceWidth) + headerRight
 	header := headerStyle.Render(headerContent)
@@ -1188,46 +1396,45 @@ func (p *tuiProgram) View() string {
 	}
 	statusStr = fmt.Sprintf("%s | %s | %s", modePart, statusStr, model)
 
-	// Accent colors: running: green; stop: amber; idle: blue(Build) or dark blue(Plan)
-	accentColor := lipgloss.Color("62") // blue (idle Build)
-	if p.runMode == tools.RunModePlan {
-		accentColor = lipgloss.Color("24") // dark blue (idle Plan)
+	// Accent colors from theme
+	isPlan := p.runMode == tools.RunModePlan
+	accentColor := p.theme.StatusIdle
+	if isPlan {
+		accentColor = p.theme.StatusPlan
 	}
-
 	if isRunning {
-		accentColor = lipgloss.Color("29")
+		accentColor = p.theme.StatusRunning
 	} else if isStop {
-		accentColor = lipgloss.Color("166") // amber
+		accentColor = p.theme.StatusStop
 	}
 
-	// Remove padding to align exactly with the input border, but add a space at the start of the string for readability
-	statusBarStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).
-		Background(accentColor).
-		Padding(0, 1).
+	// Status bar style from theme
+	statusBarStyle := p.styles.StatusBarStyle(isRunning, isStop, isPlan).
 		Width(w)
 	statusBar := statusBarStyle.Width(w).Render(statusStr)
 
-	// Input line: gray background with accent left border
-	inputStyle := lipgloss.NewStyle().
-		Background(lipgloss.Color("235")).
-		Padding(0, 1).
-		Border(lipgloss.Border{
-			Left: "┃",
-		}, false, false, false, true).
-		BorderForeground(accentColor).
-		Width(w)
+	// Input line style from theme
+	inputStyle := p.styles.InputStyle(w, accentColor)
 
 	innerWidth := w - inputStyle.GetHorizontalFrameSize()
 	inputLine := inputStyle.Render(renderSingleLineInput(p.input, p.inputPos, innerWidth))
 
-	// Footer: help hint below status bar
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1).Render("Type /help for commands. | Tab: toggle plan/build | Alt+M: toggle mouse capture")
+	// Footer style from theme
+	footer := p.styles.Footer.Render("Type /help for commands. | Tab: toggle plan/build")
 
 	// Content area (between header and input) - scrollable
+	// Generate content with ANSI first (for display)
 	content := p.buildContentString()
 	lines := strings.Split(content, "\n")
 	if len(lines) == 0 {
 		lines = []string{""}
+	}
+
+	// Ensure plainContentLines and lines have same line count
+	plainLines := p.plainContentLines
+	if len(plainLines) != len(lines) {
+		// If line count doesn't match, use lines as fallback
+		plainLines = lines
 	}
 
 	// Ensure scrollOffset is within bounds
@@ -1239,8 +1446,7 @@ func (p *tuiProgram) View() string {
 	}
 	start := p.scrollOffset
 
-	// Recalculate contentAreaHeight considering header (1) and topBar (1)
-	contentAreaHeight := p.height - 5 // inputLine(1) + statusBar(1) + footer(1) + header(1) + topBar(1)
+	contentAreaHeight := p.contentAreaHeight(w)
 	filtered := p.filteredCompletions()
 	var completionBlock string
 	if len(filtered) > 0 {
@@ -1265,20 +1471,18 @@ func (p *tuiProgram) View() string {
 			if idx == p.completionIndex {
 				arrow = "→ "
 			}
-			cLines = append(cLines, fmt.Sprintf("%s%s  %s", arrow, c.Name, c.Desc))
+			line := fmt.Sprintf("%s%s  %s", arrow, c.Name, c.Desc)
+			if idx == p.completionIndex {
+				line = p.styles.SelectedCompletionStyle().Render(line)
+			}
+			cLines = append(cLines, line)
 		}
-		completionBlock = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241")).
-			Background(lipgloss.Color("0")).
-			MaxWidth(w).
-			Padding(0, 1).
+		completionBlock = p.styles.CompletionStyle(w).
 			Render(strings.Join(cLines, "\n") + fmt.Sprintf("\n  (%d/%d)", p.completionIndex+1, len(filtered)))
-
-		contentAreaHeight -= (strings.Count(completionBlock, "\n") + 1)
 	}
 
-	if contentAreaHeight < 3 {
-		contentAreaHeight = 16
+	if contentAreaHeight < 1 {
+		contentAreaHeight = 1
 	}
 
 	end := start + contentAreaHeight
@@ -1286,7 +1490,16 @@ func (p *tuiProgram) View() string {
 		end = len(lines)
 	}
 	visibleLines := lines[start:end]
-	content = strings.Join(visibleLines, "\n")
+	visiblePlainLines := plainLines[start:end]
+
+	// Apply selection highlight
+	var renderedLines []string
+	for i, line := range visibleLines {
+		y := start + i
+		plainLine := visiblePlainLines[i]
+		renderedLines = append(renderedLines, p.renderLineWithSelection(line, plainLine, y))
+	}
+	content = strings.Join(renderedLines, "\n")
 	content += "\033[0m"
 
 	mainContent := lipgloss.NewStyle().
@@ -1301,5 +1514,57 @@ func (p *tuiProgram) View() string {
 	}
 
 	// Final view: TopBar -> Header -> Content -> Bottom
-	return lipgloss.NewStyle().Render(lipgloss.JoinVertical(lipgloss.Left, topBar, header, mainContent, bottom))
+	return lipgloss.JoinVertical(lipgloss.Left, topBar, header, mainContent, bottom)
+}
+
+// renderLineWithSelection renders line with selection highlight
+// line: original line (with ANSI)
+// plainLine: plain text line (for selection judgment)
+// y: line number
+func (p *tuiProgram) renderLineWithSelection(line, plainLine string, y int) string {
+	if !p.selection.HasSelection() {
+		return line
+	}
+
+	// Iterate through original line (preserve ANSI format), insert highlight based on selection state
+	var result strings.Builder
+	x := 0
+	i := 0
+	for i < len(line) {
+		// Skip ANSI escape sequences, write as-is
+		if line[i] == '\033' && i+1 < len(line) && line[i+1] == '[' {
+			start := i
+			i += 2
+			for i < len(line) && line[i] != 'm' {
+				i++
+			}
+			if i < len(line) {
+				i++
+			}
+			result.WriteString(line[start:i])
+			continue
+		}
+
+		// Visible characters (use grapheme cluster to avoid splitting emojis and other multi-rune characters)
+		cluster, clusterW, size := nextGrapheme(line[i:])
+
+		selected := false
+		for dx := 0; dx < clusterW; dx++ {
+			if p.selection.IsSelected(x+dx, y) {
+				selected = true
+				break
+			}
+		}
+
+		if selected {
+			result.WriteString("\033[7m")
+			result.WriteString(cluster)
+			result.WriteString("\033[0m")
+		} else {
+			result.WriteString(cluster)
+		}
+		x += clusterW
+		i += size
+	}
+	return result.String()
 }

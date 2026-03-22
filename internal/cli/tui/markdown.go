@@ -245,13 +245,10 @@ func wrapLine(line string, width int) []string {
 			}
 			continue
 		}
-		r, size := utf8.DecodeRuneInString(line[i:])
-		if r == utf8.RuneError {
-			i++
-			continue
-		}
-		// Break before this rune if we'd exceed width
-		if visible > 0 && visible >= width {
+
+		cluster, clusterW, size := nextGrapheme(line[i:])
+		// Break before this grapheme if we'd exceed width
+		if visible > 0 && visible+clusterW > width {
 			content := buf.String()
 			lastSpaceIdx := findLastSpace(content)
 			if lastSpaceIdx >= 0 {
@@ -267,8 +264,8 @@ func wrapLine(line string, width int) []string {
 				visible = 0
 			}
 		}
-		buf.WriteRune(r)
-		visible++
+		buf.WriteString(cluster)
+		visible += clusterW
 		i += size
 	}
 	if buf.Len() > 0 {
@@ -312,8 +309,8 @@ func visibleLen(s string) int {
 			}
 			continue
 		}
-		_, size := utf8.DecodeRuneInString(s[i:])
-		n++
+		_, w, size := nextGrapheme(s[i:])
+		n += w
 		i += size
 	}
 	return n

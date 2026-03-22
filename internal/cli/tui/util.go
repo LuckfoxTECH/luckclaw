@@ -6,12 +6,26 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattn/go-runewidth"
+	"github.com/rivo/uniseg"
 	"github.com/spf13/cobra"
 )
 
 func exitf(cmd *cobra.Command, format string, args ...any) error {
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...)
 	return fmt.Errorf(format, args...)
+}
+
+func nextGrapheme(s string) (cluster string, width int, size int) {
+	cluster, _, _, _ = uniseg.FirstGraphemeClusterInString(s, -1)
+	if cluster == "" {
+		r, size := utf8.DecodeRuneInString(s)
+		w := runewidth.RuneWidth(r)
+		if w < 0 {
+			w = 0
+		}
+		return string(r), w, size
+	}
+	return cluster, uniseg.StringWidth(cluster), len(cluster)
 }
 
 func runePosToByteOffset(s string, runePos int) int {
