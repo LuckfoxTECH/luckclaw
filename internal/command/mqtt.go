@@ -32,14 +32,18 @@ func (h *MQTTHandler) Execute(input Input) (Output, error) {
 			return Output{Content: "Error: too many arguments\nUsage: mqtt list", IsFinal: true}, nil
 		}
 		return h.showStatus()
-	case "add", "connect":
-		return h.connect(args, input.Flags, input.Context)
+	case "add":
+		return h.add(args, input.Flags)
+	case "connect":
+		return h.connect(args, input.Context)
 	case "disconnect":
 		return h.disconnect(args)
 	case "publish":
 		return h.publish(args, input.Flags)
 	case "subscribe":
-		return h.subscribe(args, input.Flags, input.Context)
+		return h.subscribe(args, input.Flags, input)
+	case "unsubscribe":
+		return h.unsubscribe(args)
 	case "logs":
 		return h.showLogs(args, input.Flags)
 	case "saved":
@@ -49,6 +53,11 @@ func (h *MQTTHandler) Execute(input Input) (Output, error) {
 		return h.showSaved()
 	case "rm", "delete":
 		return h.remove(args)
+	case "clear":
+		if len(args) != 0 {
+			return Output{Content: "Error: too many arguments\nUsage: mqtt clear", IsFinal: true}, nil
+		}
+		return h.clear()
 	case "restore":
 		return h.restore(args, input.Context)
 	case "clients":
@@ -115,12 +124,14 @@ func (h *MQTTHandler) showStatus() (Output, error) {
 	b.WriteString(statusStr + "\n\n" + savedStr + "\n")
 	b.WriteString("\nUsage:\n")
 	b.WriteString("  mqtt list\n")
-	b.WriteString("  mqtt connect <client_id> <broker> [--username <user>] [--password <pass>]\n")
+	b.WriteString("  mqtt add <client_id> <broker> [--username <user>] [--password <pass>]\n")
+	b.WriteString("  mqtt connect <client_id>\n")
 	b.WriteString("  mqtt disconnect <client_id>\n")
 	b.WriteString("  mqtt rm <client_id>\n")
 	b.WriteString("  mqtt publish <client_id> <topic> <payload> [--qos 0|1|2]\n")
-	b.WriteString("  mqtt subscribe <client_id> <topic> [--qos 0|1|2]\n")
-	b.WriteString("  mqtt logs <client_id> [--topic <topic>] [--limit N]\n")
+	b.WriteString("  mqtt subscribe <client_id> <topic> [--qos 0|1|2] [--alert-channel <ch>] [--alert-to <id>] [--alert-interval <s>]\n")
+	b.WriteString("  mqtt unsubscribe <client_id> <topic>\n")
+	b.WriteString("  mqtt logs <client_id> [--topic <topic>] [--limit <N>]\n")
 
 	return Output{
 		Content:    strings.TrimRight(b.String(), "\n"),
@@ -129,19 +140,9 @@ func (h *MQTTHandler) showStatus() (Output, error) {
 	}, nil
 }
 
-func (h *MQTTHandler) connect(args []string, flags map[string]string, ctx context.Context) (Output, error) {
-	if len(args) < 1 {
-		return Output{Content: "Error: missing arguments\nUsage: mqtt connect <client_id> <broker> | mqtt add <client_id> <broker>", IsFinal: true}, nil
-	}
-
-	// Single arg: try to restore saved connection
-	if len(args) == 1 {
-		clientID := strings.TrimSpace(args[0])
-		result, err := h.Tool.HandleRestore(ctx, map[string]any{"client_id": clientID})
-		if err != nil {
-			return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
-		}
-		return Output{Content: result, IsFinal: true}, nil
+func (h *MQTTHandler) add(args []string, flags map[string]string) (Output, error) {
+	if len(args) < 2 {
+		return Output{Content: "Error: missing arguments\nUsage: mqtt add <client_id> <broker> [--username <user>] [--password <pass>]", IsFinal: true}, nil
 	}
 
 	broker := strings.TrimSpace(args[0])
@@ -158,10 +159,10 @@ func (h *MQTTHandler) connect(args []string, flags map[string]string, ctx contex
 	// Parse inline flags from args
 	for i := 2; i < len(args); i++ {
 		if !strings.HasPrefix(args[i], "--") {
-			return Output{Content: fmt.Sprintf("Error: unexpected argument %q\nUsage: mqtt connect <client_id> <broker> [--username <user>] [--password <pass>]", args[i]), IsFinal: true}, nil
+			return Output{Content: fmt.Sprintf("Error: unexpected argument %q\nUsage: mqtt add <client_id> <broker> [--username <user>] [--password <pass>]", args[i]), IsFinal: true}, nil
 		}
 		if i+1 >= len(args) {
-			return Output{Content: fmt.Sprintf("Error: missing value for %s\nUsage: mqtt connect <client_id> <broker> [--username <user>] [--password <pass>]", args[i]), IsFinal: true}, nil
+			return Output{Content: fmt.Sprintf("Error: missing value for %s\nUsage: mqtt add <client_id> <broker> [--username <user>] [--password <pass>]", args[i]), IsFinal: true}, nil
 		}
 		switch strings.ToLower(args[i]) {
 		case "--username":
@@ -169,18 +170,35 @@ func (h *MQTTHandler) connect(args []string, flags map[string]string, ctx contex
 		case "--password":
 			password = strings.TrimSpace(args[i+1])
 		default:
-			return Output{Content: fmt.Sprintf("Error: unknown flag %s\nUsage: mqtt connect <client_id> <broker> [--username <user>] [--password <pass>]", args[i]), IsFinal: true}, nil
+			return Output{Content: fmt.Sprintf("Error: unknown flag %s\nUsage: mqtt add <client_id> <broker> [--username <user>] [--password <pass>]", args[i]), IsFinal: true}, nil
 		}
 		i++
 	}
 
-	result, err := h.Tool.HandleConnect(map[string]any{
+	result, err := h.Tool.HandleAdd(map[string]any{
 		"broker":        broker,
 		"client_id":     clientID,
 		"username":      username,
 		"password":      password,
 		"clean_session": true,
 	})
+	if err != nil {
+		return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
+	}
+	return Output{Content: result, IsFinal: true}, nil
+}
+
+func (h *MQTTHandler) connect(args []string, ctx context.Context) (Output, error) {
+	if len(args) < 1 {
+		saved, _ := h.Tool.HandleSaved()
+		return Output{Content: "Error: missing <client_id>\nUsage: mqtt connect <client_id>\n\n" + saved, IsFinal: true}, nil
+	}
+	if len(args) > 1 {
+		return Output{Content: "Error: too many arguments\nUsage: mqtt connect <client_id>", IsFinal: true}, nil
+	}
+
+	clientID := strings.TrimSpace(args[0])
+	result, err := h.Tool.HandleRestore(ctx, map[string]any{"client_id": clientID})
 	if err != nil {
 		return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
 	}
@@ -270,14 +288,14 @@ func (h *MQTTHandler) publish(args []string, flags map[string]string) (Output, e
 	return Output{Content: result, IsFinal: true}, nil
 }
 
-func (h *MQTTHandler) subscribe(args []string, flags map[string]string, ctx context.Context) (Output, error) {
+func (h *MQTTHandler) subscribe(args []string, flags map[string]string, input Input) (Output, error) {
 	if len(args) < 2 {
 		clients := h.Tool.ListClients()
 		if len(clients) == 0 {
-			return Output{Content: "Error: missing arguments\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2]\n\nNo MQTT clients available.", IsFinal: true}, nil
+			return Output{Content: "Error: missing arguments\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2] [--alert-channel <channel>] [--alert-to <id>] [--alert-interval <seconds>]\n\nNo MQTT clients available.", IsFinal: true}, nil
 		}
 		var b strings.Builder
-		b.WriteString("Usage: mqtt subscribe <client_id> <topic> [--qos 0|1|2]\n\nAvailable clients:\n")
+		b.WriteString("Usage: mqtt subscribe <client_id> <topic> [--qos 0|1|2] [--alert-channel <channel>] [--alert-to <id>] [--alert-interval <seconds>]\n\nAvailable clients:\n")
 		for _, c := range clients {
 			status := "disconnected"
 			if c.Connected {
@@ -292,30 +310,59 @@ func (h *MQTTHandler) subscribe(args []string, flags map[string]string, ctx cont
 	topic := strings.TrimSpace(args[1])
 	qos := 0
 
+	// Get alert parameters
+	alertChannel := strings.TrimSpace(flags["alert-channel"])
+	alertChatID := strings.TrimSpace(flags["alert-to"])
+	alertInterval := 0
+	if v, ok := flags["alert-interval"]; ok {
+		fmt.Sscanf(v, "%d", &alertInterval)
+	}
+
 	if q, ok := flags["qos"]; ok {
 		fmt.Sscanf(q, "%d", &qos)
 	}
 	for i := 2; i < len(args); i++ {
 		if !strings.HasPrefix(args[i], "--") {
-			return Output{Content: fmt.Sprintf("Error: unexpected argument %q\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2]", args[i]), IsFinal: true}, nil
+			return Output{Content: fmt.Sprintf("Error: unexpected argument %q\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2] [--alert-channel <channel>] [--alert-to <id>] [--alert-interval <seconds>]", args[i]), IsFinal: true}, nil
 		}
 		if i+1 >= len(args) {
-			return Output{Content: fmt.Sprintf("Error: missing value for %s\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2]", args[i]), IsFinal: true}, nil
+			return Output{Content: fmt.Sprintf("Error: missing value for %s\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2] [--alert-channel <channel>] [--alert-to <id>] [--alert-interval <seconds>]", args[i]), IsFinal: true}, nil
 		}
 		switch strings.ToLower(args[i]) {
 		case "--qos":
 			fmt.Sscanf(args[i+1], "%d", &qos)
+		case "--alert-channel":
+			alertChannel = strings.TrimSpace(args[i+1])
+		case "--alert-to":
+			alertChatID = strings.TrimSpace(args[i+1])
+		case "--alert-interval":
+			fmt.Sscanf(args[i+1], "%d", &alertInterval)
 		default:
-			return Output{Content: fmt.Sprintf("Error: unknown flag %s\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2]", args[i]), IsFinal: true}, nil
+			return Output{Content: fmt.Sprintf("Error: unknown flag %s\nUsage: mqtt subscribe <client_id> <topic> [--qos 0|1|2] [--alert-channel <channel>] [--alert-to <id>] [--alert-interval <seconds>]", args[i]), IsFinal: true}, nil
 		}
 		i++
 	}
 
-	result, err := h.Tool.HandleSubscribe(ctx, map[string]any{
+	// Use current session's channel/chat_id if alert params not provided
+	if alertChannel == "" {
+		alertChannel = input.Channel
+	}
+	if alertChatID == "" {
+		alertChatID = input.ChatID
+	}
+
+	toolArgs := map[string]any{
 		"client_id": clientID,
 		"topic":     topic,
 		"qos":       qos,
-	})
+	}
+	if alertChannel != "" && alertChatID != "" {
+		toolArgs["alert_channel"] = alertChannel
+		toolArgs["alert_chat_id"] = alertChatID
+		toolArgs["alert_interval"] = alertInterval
+	}
+
+	result, err := h.Tool.HandleSubscribe(input.Context, toolArgs)
 	if err != nil {
 		return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
 	}
@@ -366,6 +413,40 @@ func (h *MQTTHandler) showLogs(args []string, flags map[string]string) (Output, 
 	return Output{Content: result, IsFinal: true}, nil
 }
 
+func (h *MQTTHandler) unsubscribe(args []string) (Output, error) {
+	if len(args) < 2 {
+		clients := h.Tool.ListClients()
+		if len(clients) == 0 {
+			return Output{Content: "Error: missing arguments\nUsage: mqtt unsubscribe <client_id> <topic>\n\nNo MQTT clients available.", IsFinal: true}, nil
+		}
+		var b strings.Builder
+		b.WriteString("Usage: mqtt unsubscribe <client_id> <topic>\n\nAvailable clients:\n")
+		for _, c := range clients {
+			status := "disconnected"
+			if c.Connected {
+				status = "connected"
+			}
+			b.WriteString(fmt.Sprintf("  - %s: broker=%s status=%s\n", c.ClientID, c.Broker, status))
+		}
+		return Output{Content: strings.TrimRight(b.String(), "\n"), IsFinal: true}, nil
+	}
+	if len(args) > 2 {
+		return Output{Content: "Error: too many arguments\nUsage: mqtt unsubscribe <client_id> <topic>", IsFinal: true}, nil
+	}
+
+	clientID := strings.TrimSpace(args[0])
+	topic := strings.TrimSpace(args[1])
+
+	result, err := h.Tool.HandleUnsubscribe(map[string]any{
+		"client_id": clientID,
+		"topic":     topic,
+	})
+	if err != nil {
+		return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
+	}
+	return Output{Content: result, IsFinal: true}, nil
+}
+
 func (h *MQTTHandler) showSaved() (Output, error) {
 	result, err := h.Tool.HandleSaved()
 	if err != nil {
@@ -387,6 +468,14 @@ func (h *MQTTHandler) remove(args []string) (Output, error) {
 	}
 	clientID := strings.TrimSpace(args[0])
 	result, err := h.Tool.HandleRemove(map[string]any{"client_id": clientID})
+	if err != nil {
+		return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
+	}
+	return Output{Content: result, IsFinal: true}, nil
+}
+
+func (h *MQTTHandler) clear() (Output, error) {
+	result, err := h.Tool.HandleClear()
 	if err != nil {
 		return Output{Content: "Error: " + err.Error(), IsFinal: true}, nil
 	}
@@ -437,12 +526,17 @@ func (h *MQTTHandler) listClients() (Output, error) {
 
 func (h *MQTTHandler) helpText() string {
 	return `MQTT commands:
-  mqtt list                              List connections
-  mqtt connect <client_id> <broker>      Connect to broker
-  mqtt disconnect <client_id>            Disconnect from broker
-  mqtt publish <client_id> <topic> <payload>  Publish message
-  mqtt subscribe <client_id> <topic>     Subscribe to topic
-  mqtt logs <client_id>                  Show message logs
-  mqtt rm <client_id>                    Remove saved connection
-  mqtt clients                           List all clients`
+  mqtt list                                       List connections
+  mqtt add <client_id> <broker>                   Add connection (save locally)
+         [--username <user>] [--password <pass>]
+  mqtt connect <client_id>                        Connect to saved connection
+  mqtt disconnect <client_id>                     Disconnect from broker
+  mqtt publish <client_id> <topic> <payload>      Publish message
+  mqtt subscribe <client_id> <topic>              Subscribe to topic
+         [--qos 0|1|2] [--alert-channel <ch>] [--alert-to <id>] [--alert-interval <s>]
+  mqtt unsubscribe <client_id> <topic>            Unsubscribe from topic
+  mqtt logs <client_id>                           Show message logs
+  mqtt rm <client_id>                             Remove saved connection
+  mqtt clear                                      Clear all saved connections
+  mqtt clients                                    List all clients`
 }

@@ -19,10 +19,25 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
+// TopicAlert configures alert delivery when a subscribed topic receives a message.
+type TopicAlert struct {
+	Channel        string    `json:"channel"`          // delivery channel (e.g. "telegram", "discord")
+	ChatID         string    `json:"chat_id"`          // target chat ID
+	MinIntervalSec int       `json:"min_interval_sec"` // minimum seconds between alerts (0 = no limit)
+	Enabled        bool      `json:"enabled"`          // whether alert is enabled
+	LastAlertTime  time.Time `json:"-"`                // last alert sent time (not persisted)
+}
+
 type MQTTTool struct {
 	Workspace string
 	LogDir    string
 	Logger    logging.Logger
+
+	// OnMessage is called when a subscribed topic receives a message and alert is configured.
+	OnMessage func(clientID, topic, payload, channel, chatID string)
+
+	// OnTopicMessage is called when any subscribed topic receives a message (for TUI display).
+	OnTopicMessage func(clientID, topic, payload string)
 
 	connections map[string]*mqttConnection
 	mu          sync.RWMutex
@@ -48,29 +63,38 @@ type mqttPersistedFile struct {
 }
 
 type mqttPersistedConn struct {
-	ClientID     string `json:"client_id"`
-	Broker       string `json:"broker"`
-	Username     string `json:"username,omitempty"`
-	CleanSession bool   `json:"clean_session"`
+	ClientID     string                        `json:"client_id"`
+	Broker       string                        `json:"broker"`
+	Username     string                        `json:"username,omitempty"`
+	CleanSession bool                          `json:"clean_session"`
+	TopicAlerts  map[string]mqttPersistedAlert `json:"topic_alerts,omitempty"`
+}
+
+type mqttPersistedAlert struct {
+	Channel        string `json:"channel"`
+	ChatID         string `json:"chat_id"`
+	MinIntervalSec int    `json:"min_interval_sec"`
+	Enabled        bool   `json:"enabled"`
 }
 
 type mqttConnection struct {
-	ID       string
-	Broker   string
-	ClientID string
-	Username string
-	Password string
-	Clean    bool
-	Client   mqtt.Client
-	LogDir   string
-	Topics   map[string]mqtt.MessageHandler
+	ID          string
+	Broker      string
+	ClientID    string
+	Username    string
+	Password    string
+	Clean       bool
+	Client      mqtt.Client
+	LogDir      string
+	Topics      map[string]mqtt.MessageHandler
+	TopicAlerts map[string]*TopicAlert
 }
 
 func (t *MQTTTool) Name() string { return "mqtt" }
 
 func (t *MQTTTool) Description() string {
 	return "Connect to MQTT brokers, publish messages, and subscribe to topics with background monitoring. " +
-		"Actions: connect, disconnect, publish, subscribe, status, logs, saved, list, restore."
+		"Actions: connect, disconnect, publish, subscribe, unsubscribe, status, logs, saved, list, restore."
 }
 
 func (t *MQTTTool) Parameters() map[string]any {
@@ -79,8 +103,8 @@ func (t *MQTTTool) Parameters() map[string]any {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"description": "Action: connect, disconnect, publish, subscribe, status, logs, saved, list, restore",
-				"enum":        []any{"connect", "disconnect", "publish", "subscribe", "status", "logs", "saved", "list", "restore"},
+				"description": "Action: connect, disconnect, publish, subscribe, unsubscribe, status, logs, saved, list, restore",
+				"enum":        []any{"connect", "disconnect", "publish", "subscribe", "unsubscribe", "status", "logs", "saved", "list", "restore"},
 			},
 			"client_id": map[string]any{
 				"type":        "string",
@@ -122,6 +146,19 @@ func (t *MQTTTool) Parameters() map[string]any {
 				"minimum":     1,
 				"maximum":     1000,
 			},
+			"alert_channel": map[string]any{
+				"type":        "string",
+				"description": "Channel for alert delivery (e.g. 'telegram', 'discord')",
+			},
+			"alert_chat_id": map[string]any{
+				"type":        "string",
+				"description": "Chat ID for alert delivery",
+			},
+			"alert_interval": map[string]any{
+				"type":        "integer",
+				"description": "Minimum seconds between alerts (0 = no limit, default 0)",
+				"minimum":     0,
+			},
 		},
 		"required": []any{"action"},
 	}
@@ -135,6 +172,8 @@ func (t *MQTTTool) Execute(ctx context.Context, args map[string]any) (string, er
 	}
 
 	switch action {
+	case "add":
+		return t.HandleAdd(args)
 	case "connect":
 		return t.HandleConnect(args)
 	case "disconnect":
@@ -143,6 +182,8 @@ func (t *MQTTTool) Execute(ctx context.Context, args map[string]any) (string, er
 		return t.HandlePublish(args)
 	case "subscribe":
 		return t.HandleSubscribe(ctx, args)
+	case "unsubscribe":
+		return t.HandleUnsubscribe(args)
 	case "status":
 		return t.HandleStatus()
 	case "logs":
@@ -217,12 +258,25 @@ func (t *MQTTTool) persistCurrentLocked() error {
 		if c == nil {
 			continue
 		}
-		out.Connections = append(out.Connections, mqttPersistedConn{
+		pc := mqttPersistedConn{
 			ClientID:     c.ClientID,
 			Broker:       c.Broker,
 			Username:     c.Username,
 			CleanSession: c.Clean,
-		})
+		}
+		// Persist topic alerts
+		if len(c.TopicAlerts) > 0 {
+			pc.TopicAlerts = make(map[string]mqttPersistedAlert)
+			for topic, alert := range c.TopicAlerts {
+				pc.TopicAlerts[topic] = mqttPersistedAlert{
+					Channel:        alert.Channel,
+					ChatID:         alert.ChatID,
+					MinIntervalSec: alert.MinIntervalSec,
+					Enabled:        alert.Enabled,
+				}
+			}
+		}
+		out.Connections = append(out.Connections, pc)
 	}
 	return t.savePersisted(out)
 }
@@ -294,13 +348,14 @@ func (t *MQTTTool) HandleConnect(args map[string]any) (string, error) {
 	})
 
 	conn := &mqttConnection{
-		ID:       clientID,
-		Broker:   broker,
-		ClientID: clientID,
-		Username: username,
-		Password: password,
-		Clean:    clean,
-		Topics:   make(map[string]mqtt.MessageHandler),
+		ID:          clientID,
+		Broker:      broker,
+		ClientID:    clientID,
+		Username:    username,
+		Password:    password,
+		Clean:       clean,
+		Topics:      make(map[string]mqtt.MessageHandler),
+		TopicAlerts: make(map[string]*TopicAlert),
 	}
 
 	logDir := t.LogDir
@@ -337,6 +392,65 @@ func (t *MQTTTool) HandleConnect(args map[string]any) (string, error) {
 	_ = t.persistCurrentLocked()
 
 	return fmt.Sprintf("Connected to %s as %q (log_dir: %s)", broker, clientID, logDir), nil
+}
+
+func (t *MQTTTool) HandleAdd(args map[string]any) (string, error) {
+	clientID, _ := args["client_id"].(string)
+	broker, _ := args["broker"].(string)
+	username, _ := args["username"].(string)
+	password, _ := args["password"].(string)
+	clean, _ := args["clean_session"].(bool)
+
+	clientID = strings.TrimSpace(clientID)
+	broker = strings.TrimSpace(broker)
+	username = strings.TrimSpace(username)
+	password = strings.TrimSpace(password)
+
+	if clientID == "" {
+		return "", fmt.Errorf("client_id is required")
+	}
+	if broker == "" {
+		return "", fmt.Errorf("broker is required")
+	}
+	if !strings.Contains(broker, "://") {
+		broker = "tcp://" + broker
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ensureConnectionsLocked()
+
+	// Check if already exists
+	if existing, ok := t.connections[clientID]; ok {
+		return fmt.Sprintf("Client %q already exists (broker: %s, connected: %v)", clientID, existing.Broker, existing.Client != nil && existing.Client.IsConnected()), nil
+	}
+
+	// Create connection entry without actually connecting
+	conn := &mqttConnection{
+		ID:          clientID,
+		Broker:      broker,
+		ClientID:    clientID,
+		Username:    username,
+		Password:    password,
+		Clean:       clean,
+		Topics:      make(map[string]mqtt.MessageHandler),
+		TopicAlerts: make(map[string]*TopicAlert),
+	}
+
+	logDir := t.LogDir
+	if logDir == "" {
+		logDir = t.Workspace
+	}
+	conn.LogDir = logDir
+
+	t.connections[clientID] = conn
+	_ = t.persistCurrentLocked()
+
+	user := ""
+	if username != "" {
+		user = fmt.Sprintf(" username=%s", username)
+	}
+	return fmt.Sprintf("Added connection %q (broker: %s%s). Use 'mqtt connect %s' to connect.", clientID, broker, user, clientID), nil
 }
 
 func (t *MQTTTool) HandleDisconnect(args map[string]any) (string, error) {
@@ -387,6 +501,29 @@ func (t *MQTTTool) HandleRemove(args map[string]any) (string, error) {
 	return fmt.Sprintf("Removed client %q", clientID), nil
 }
 
+func (t *MQTTTool) HandleClear() (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ensureConnectionsLocked()
+
+	count := len(t.connections)
+	if count == 0 {
+		return "No connections to clear.", nil
+	}
+
+	// Disconnect all clients first
+	for _, c := range t.connections {
+		if c.Client != nil && c.Client.IsConnected() {
+			c.Client.Disconnect(250)
+		}
+	}
+
+	// Clear all connections
+	t.connections = make(map[string]*mqttConnection)
+	_ = t.persistCurrentLocked()
+	return fmt.Sprintf("Cleared %d connection(s).", count), nil
+}
+
 func (t *MQTTTool) HandleSaved() (string, error) {
 	f, err := t.loadPersisted()
 	if err != nil {
@@ -409,40 +546,85 @@ func (t *MQTTTool) HandleSaved() (string, error) {
 }
 
 func (t *MQTTTool) HandleList() (string, error) {
-	f, err := t.loadPersisted()
-	if err != nil {
-		return "", err
-	}
-	if len(f.Connections) == 0 {
-		return fmt.Sprintf("No saved MQTT connections. (file: %s)", t.persistedPath()), nil
-	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 
-	var offline []mqttPersistedConn
-	for _, c := range f.Connections {
-		t.mu.RLock()
-		conn := t.connections[c.ClientID]
-		connected := conn != nil && conn.Client != nil && conn.Client.IsConnected()
-		t.mu.RUnlock()
-		if !connected {
-			offline = append(offline, c)
-		}
-	}
-
-	if len(offline) == 0 {
-		return "All saved MQTT clients are currently connected.", nil
+	if len(t.connections) == 0 {
+		return "No MQTT connections.", nil
 	}
 
 	var b strings.Builder
-	b.WriteString("Saved MQTT clients (not connected):\n")
-	for _, c := range offline {
-		user := ""
-		if strings.TrimSpace(c.Username) != "" {
-			user = " username=" + c.Username
+	b.WriteString("MQTT Connections:\n")
+
+	for id, conn := range t.connections {
+		status := "disconnected"
+		if conn.Client != nil && conn.Client.IsConnected() {
+			status = "connected"
 		}
-		b.WriteString(fmt.Sprintf("- %s: broker=%s clean_session=%v%s\n", c.ClientID, c.Broker, c.CleanSession, user))
+		user := ""
+		if strings.TrimSpace(conn.Username) != "" {
+			user = " username=" + conn.Username
+		}
+		b.WriteString(fmt.Sprintf("- %s: broker=%s status=%s%s\n", id, conn.Broker, status, user))
+
+		// Show subscribed topics with alert status
+		if len(conn.Topics) > 0 {
+			b.WriteString("  Subscribed topics:\n")
+			for topic := range conn.Topics {
+				alertStatus := "no alert"
+				if alert, ok := conn.TopicAlerts[topic]; ok && alert.Enabled {
+					alertStatus = fmt.Sprintf("alert → %s:%s (interval: %ds)", alert.Channel, alert.ChatID, alert.MinIntervalSec)
+				} else if alert, ok := conn.TopicAlerts[topic]; ok && !alert.Enabled {
+					alertStatus = "alert disabled"
+				}
+				b.WriteString(fmt.Sprintf("    - %s [%s]\n", topic, alertStatus))
+			}
+		}
 	}
-	b.WriteString(fmt.Sprintf("\nFile: %s", t.persistedPath()))
+
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func (t *MQTTTool) HandleUnsubscribe(args map[string]any) (string, error) {
+	clientID, _ := args["client_id"].(string)
+	topic, _ := args["topic"].(string)
+
+	clientID = strings.TrimSpace(clientID)
+	topic = strings.TrimSpace(topic)
+
+	if clientID == "" {
+		return "", fmt.Errorf("client_id is required")
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	conn, ok := t.connections[clientID]
+	if !ok {
+		return "", fmt.Errorf("client %q not found", clientID)
+	}
+
+	// Remove alert if exists
+	if conn.TopicAlerts != nil {
+		delete(conn.TopicAlerts, topic)
+	}
+
+	// Unsubscribe from topic
+	if conn.Client != nil && conn.Client.IsConnected() {
+		if _, exists := conn.Topics[topic]; exists {
+			token := conn.Client.Unsubscribe(topic)
+			if token.Wait() && token.Error() != nil {
+				return "", fmt.Errorf("unsubscribe failed: %w", token.Error())
+			}
+			delete(conn.Topics, topic)
+		}
+	} else {
+		// Client not connected, just remove from local tracking
+		delete(conn.Topics, topic)
+	}
+
+	_ = t.persistCurrentLocked()
+	return fmt.Sprintf("Unsubscribed from topic %q (client: %s)", topic, clientID), nil
 }
 
 func (t *MQTTTool) HandleRestore(ctx context.Context, args map[string]any) (string, error) {
@@ -487,6 +669,26 @@ func (t *MQTTTool) HandleRestore(ctx context.Context, args map[string]any) (stri
 			continue
 		}
 		b.WriteString(out + "\n")
+
+		// Restore topic alerts
+		if len(c.TopicAlerts) > 0 {
+			t.mu.Lock()
+			if conn := t.connections[c.ClientID]; conn != nil {
+				if conn.TopicAlerts == nil {
+					conn.TopicAlerts = make(map[string]*TopicAlert)
+				}
+				for topic, pa := range c.TopicAlerts {
+					conn.TopicAlerts[topic] = &TopicAlert{
+						Channel:        pa.Channel,
+						ChatID:         pa.ChatID,
+						MinIntervalSec: pa.MinIntervalSec,
+						Enabled:        pa.Enabled,
+					}
+				}
+			}
+			t.mu.Unlock()
+			b.WriteString(fmt.Sprintf("  Restored %d topic alert(s) for %s\n", len(c.TopicAlerts), c.ClientID))
+		}
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
@@ -548,6 +750,26 @@ func (t *MQTTTool) HandleSubscribe(ctx context.Context, args map[string]any) (st
 		return "", fmt.Errorf("client %q is not connected", clientID)
 	}
 
+	// Configure alert if parameters provided
+	alertChannel, _ := args["alert_channel"].(string)
+	alertChatID, _ := args["alert_chat_id"].(string)
+	minInterval, _ := args["alert_interval"].(int)
+
+	if alertChannel != "" && alertChatID != "" {
+		t.mu.Lock()
+		if conn.TopicAlerts == nil {
+			conn.TopicAlerts = make(map[string]*TopicAlert)
+		}
+		conn.TopicAlerts[topic] = &TopicAlert{
+			Channel:        strings.TrimSpace(alertChannel),
+			ChatID:         strings.TrimSpace(alertChatID),
+			MinIntervalSec: minInterval,
+			Enabled:        true,
+		}
+		t.mu.Unlock()
+		_ = t.persistCurrentLocked()
+	}
+
 	qosLevel := byte(qos)
 	if qos < 0 || qos > 2 {
 		qosLevel = 0
@@ -558,12 +780,38 @@ func (t *MQTTTool) HandleSubscribe(ctx context.Context, args map[string]any) (st
 
 	handler := func(client mqtt.Client, msg mqtt.Message) {
 		ts := time.Now().Format(time.RFC3339)
-		entry := fmt.Sprintf("[%s] topic=%s qos=%d payload=%q\n", ts, msg.Topic(), msg.Qos(), string(msg.Payload()))
+		payload := string(msg.Payload())
+		entry := fmt.Sprintf("[%s] topic=%s qos=%d payload=%q\n", ts, msg.Topic(), msg.Qos(), payload)
 		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
 			f.WriteString(entry)
 			f.Close()
 		}
 		t.debugf("[mqtt] %s", strings.TrimRight(entry, "\n"))
+
+		// Check for topic alert
+		t.mu.RLock()
+		alert, hasAlert := conn.TopicAlerts[msg.Topic()]
+		needsSend := false
+		var alertChannel, alertChatID string
+		if hasAlert && alert.Enabled && t.OnMessage != nil {
+			now := time.Now()
+			if alert.MinIntervalSec <= 0 || now.Sub(alert.LastAlertTime) >= time.Duration(alert.MinIntervalSec)*time.Second {
+				alert.LastAlertTime = now
+				needsSend = true
+				alertChannel = alert.Channel
+				alertChatID = alert.ChatID
+			}
+		}
+		t.mu.RUnlock()
+
+		if needsSend {
+			t.OnMessage(clientID, msg.Topic(), payload, alertChannel, alertChatID)
+		}
+
+		// Call OnTopicMessage for TUI display
+		if t.OnTopicMessage != nil {
+			t.OnTopicMessage(clientID, msg.Topic(), payload)
+		}
 	}
 
 	token := conn.Client.Subscribe(topic, qosLevel, handler)
@@ -573,7 +821,11 @@ func (t *MQTTTool) HandleSubscribe(ctx context.Context, args map[string]any) (st
 
 	conn.Topics[topic] = handler
 
-	return fmt.Sprintf("Subscribed to %q (client: %s, QoS: %d, log: %s)", topic, clientID, qos, logPath), nil
+	result := fmt.Sprintf("Subscribed to %q (client: %s, QoS: %d, log: %s)", topic, clientID, qos, logPath)
+	if alertChannel != "" && alertChatID != "" {
+		result += fmt.Sprintf("\nAlert configured: → %s:%s (interval: %ds)", alertChannel, alertChatID, minInterval)
+	}
+	return result, nil
 }
 
 func (t *MQTTTool) sanitizeFilename(topic string) string {
@@ -673,13 +925,22 @@ func (t *MQTTTool) HandleLogs(args map[string]any) (string, error) {
 	return result, nil
 }
 
+type mqttTopicAlert struct {
+	Topic          string `json:"topic"`
+	Channel        string `json:"channel"`
+	ChatID         string `json:"chat_id"`
+	MinIntervalSec int    `json:"min_interval_sec"`
+	Enabled        bool   `json:"enabled"`
+}
+
 type mqttClientInfo struct {
-	ClientID  string   `json:"client_id"`
-	Broker    string   `json:"broker"`
-	Username  string   `json:"username,omitempty"`
-	Connected bool     `json:"connected"`
-	LogDir    string   `json:"log_dir"`
-	Topics    []string `json:"topics"`
+	ClientID    string           `json:"client_id"`
+	Broker      string           `json:"broker"`
+	Username    string           `json:"username,omitempty"`
+	Connected   bool             `json:"connected"`
+	LogDir      string           `json:"log_dir"`
+	Topics      []string         `json:"topics"`
+	TopicAlerts []mqttTopicAlert `json:"topic_alerts,omitempty"`
 }
 
 func (t *MQTTTool) ListClients() []mqttClientInfo {
@@ -693,13 +954,26 @@ func (t *MQTTTool) ListClients() []mqttClientInfo {
 			topics = append(topics, t)
 		}
 		connected := conn.Client != nil && conn.Client.IsConnected()
+
+		var topicAlerts []mqttTopicAlert
+		for topic, alert := range conn.TopicAlerts {
+			topicAlerts = append(topicAlerts, mqttTopicAlert{
+				Topic:          topic,
+				Channel:        alert.Channel,
+				ChatID:         alert.ChatID,
+				MinIntervalSec: alert.MinIntervalSec,
+				Enabled:        alert.Enabled,
+			})
+		}
+
 		clients = append(clients, mqttClientInfo{
-			ClientID:  conn.ClientID,
-			Broker:    conn.Broker,
-			Username:  conn.Username,
-			Connected: connected,
-			LogDir:    conn.LogDir,
-			Topics:    topics,
+			ClientID:    conn.ClientID,
+			Broker:      conn.Broker,
+			Username:    conn.Username,
+			Connected:   connected,
+			LogDir:      conn.LogDir,
+			Topics:      topics,
+			TopicAlerts: topicAlerts,
 		})
 	}
 	return clients
