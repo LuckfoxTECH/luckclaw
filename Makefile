@@ -2,8 +2,10 @@
 # Default: full build with browser tool (~20MB)
 # Minimal: -tags nobrowser excludes go-rod (~15MB)
 
+VERSION := 0.0.2
+
 .PHONY: build build-minimal build-armv7 build-armv7-minimal build-arm64 build-arm64-minimal clean
-LDFLAGS := -ldflags="-s -w"
+LDFLAGS := -ldflags="-s -w -X=luckclaw/internal/cli.Version=$(VERSION)"
 
 build:
 	go build $(LDFLAGS) -o luckclaw ./cmd/luckclaw

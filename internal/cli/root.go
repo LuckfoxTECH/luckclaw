@@ -13,7 +13,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var version = "0.0.1"
+var Version = "0.0.1"
 
 func RootBanner() string {
 	luckStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF9600")).Bold(true)
@@ -34,7 +34,7 @@ func NewRootCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprint(out, RootBanner())
-			_, _ = fmt.Fprintf(out, "🍀 luckclaw v%s\n", version)
+			_, _ = fmt.Fprintf(out, "🍀 luckclaw v%s\n", Version)
 			_, _ = fmt.Fprintln(out, gateway.StatusLine())
 			_, _ = fmt.Fprintln(out)
 			return cmd.Help()
@@ -44,7 +44,7 @@ func NewRootCmd() *cobra.Command {
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
 
-	root.Version = version
+	root.Version = Version
 	root.SetVersionTemplate("luckclaw v{{.Version}}\n")
 
 	root.AddCommand(newOnboardCmd())
