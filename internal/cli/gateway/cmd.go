@@ -22,6 +22,7 @@ import (
 	"luckclaw/internal/providers/openaiapi"
 	"luckclaw/internal/service"
 	sessionpkg "luckclaw/internal/session"
+	"luckclaw/internal/tools"
 
 	"github.com/spf13/cobra"
 )
@@ -152,6 +153,22 @@ func NewCmd() *cobra.Command {
 				log.Printf("[cron] Load: %d job(s) from %s", len(jobs), cronPath)
 			}
 			loop.SetCron(cronSvc)
+
+			// Set MQTT alert callback
+			if mqttTool := loop.Tools.Get("mqtt"); mqttTool != nil {
+				if mt, ok := mqttTool.(*tools.MQTTTool); ok {
+					mt.OnMessage = func(clientID, topic, payload, channel, chatID string) {
+						alertMsg := fmt.Sprintf("[MQTT Alert] client: %s, topic: %s, payload: %s", clientID, topic, payload)
+						log.Printf("[mqtt] alert: client=%s topic=%s → %s:%s", clientID, topic, channel, chatID)
+						_ = messageBus.PublishOutbound(context.Background(), bus.OutboundMessage{
+							Channel: channel,
+							ChatID:  chatID,
+							Content: alertMsg,
+						})
+					}
+				}
+			}
+
 			cronSvc.SetCallback(func(ctx context.Context, job cron.Job) (string, error) {
 				log.Printf("[cron] callback: job=%s running msg=%q reminderOnly=%v", job.ID, job.Payload.Message, job.Payload.ReminderOnly)
 				deliver, ch, to := job.Payload.Deliver, job.Payload.Channel, job.Payload.To
