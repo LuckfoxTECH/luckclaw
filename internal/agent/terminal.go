@@ -16,12 +16,13 @@ type terminalState struct {
 }
 
 type terminalItem struct {
-	Type         string        `json:"type"`
-	SSH          tools.SSHConn `json:"ssh"`
-	RemoteBins   []string      `json:"remote_bins"`
-	RemoteHome   string        `json:"remote_home"`
-	SyncedSkills []string      `json:"synced_skills"`
-	RefreshedAt  string        `json:"refreshed_at"`
+	Type         string           `json:"type"`
+	SSH          tools.SSHConn    `json:"ssh"`
+	RemoteBins   []string         `json:"remote_bins"`
+	RemoteHome   string           `json:"remote_home"`
+	SyncedSkills []string         `json:"synced_skills"`
+	RefreshedAt  string           `json:"refreshed_at"`
+	EnvInfo      *command.EnvInfo `json:"env_info,omitempty"` // Remote terminal environment info
 }
 
 func (a *AgentLoop) setTerminalPassword(sessionKey string, termName string, password string) {
@@ -79,6 +80,13 @@ func (a *AgentLoop) deleteTerminalPassword(sessionKey string, termName string) {
 	}
 }
 
+// ClearActiveTerminal clears active terminal state for session
+func (a *AgentLoop) ClearActiveTerminal(sessionKey string) {
+	a.activeTerminalsMu.Lock()
+	defer a.activeTerminalsMu.Unlock()
+	delete(a.activeTerminals, sessionKey)
+}
+
 func (a *AgentLoop) resolveSSHConn(sessionKey string, termName string, c tools.SSHConn) (tools.SSHConn, error) {
 	if strings.TrimSpace(c.PasswordEnv) != "" {
 		if v := os.Getenv(strings.TrimSpace(c.PasswordEnv)); strings.TrimSpace(v) != "" {
@@ -102,20 +110,20 @@ func (a *AgentLoop) resolveSSHConn(sessionKey string, termName string, c tools.S
 	return c, nil
 }
 
-func (a *AgentLoop) activeTerminalContext(sessionKey string, st terminalState) (*tools.TerminalContext, []string, string, error) {
+func (a *AgentLoop) activeTerminalContext(sessionKey string, st terminalState) (*tools.TerminalContext, []string, string, *command.EnvInfo, error) {
 	name := strings.TrimSpace(st.Active)
 	if name == "" {
-		return nil, nil, "", nil
+		return nil, nil, "", nil, nil
 	}
 	it, ok := st.Terminals[name]
 	if !ok || strings.TrimSpace(it.Type) == "" {
-		return nil, nil, "", nil
+		return nil, nil, "", nil, nil
 	}
 	sshConn, err := a.resolveSSHConn(sessionKey, name, it.SSH)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", nil, err
 	}
-	return &tools.TerminalContext{Name: name, Type: it.Type, SSH: sshConn}, it.RemoteBins, it.RemoteHome, nil
+	return &tools.TerminalContext{Name: name, Type: it.Type, SSH: sshConn}, it.RemoteBins, it.RemoteHome, it.EnvInfo, nil
 }
 
 func (a *AgentLoop) terminalContextForName(sessionKey string, st terminalState, name string) (*tools.TerminalContext, []string, string, error) {
@@ -146,6 +154,7 @@ func (a *AgentLoop) loadTerminalState(s *session.Session) terminalState {
 				RemoteHome:   e.RemoteHome,
 				SyncedSkills: e.SyncedSkills,
 				RefreshedAt:  e.UpdatedAt,
+				EnvInfo:      e.EnvInfo,
 			}
 		}
 	}
@@ -190,6 +199,7 @@ func (a *AgentLoop) saveterminal(store command.TerminalStore, terminals map[stri
 			RemoteHome:   it.RemoteHome,
 			SyncedSkills: it.SyncedSkills,
 			UpdatedAt:    time.Now().Format(time.RFC3339Nano),
+			EnvInfo:      it.EnvInfo,
 		}
 	}
 	return command.SaveTerminalStore(store)

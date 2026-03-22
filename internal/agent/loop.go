@@ -407,7 +407,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 			if a.OnTerminalResolved != nil {
 				s, _ := a.Sessions.GetOrCreate(sessionKey)
 				st := a.loadTerminalState(s)
-				termCtx, _, _, _ := a.activeTerminalContext(sessionKey, st)
+				termCtx, _, _, _, _ := a.activeTerminalContext(sessionKey, st)
 				a.OnTerminalResolved(channel, chatID, formatTerminalLabel(termCtx))
 			}
 			return resp, false, nil
@@ -428,7 +428,8 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	}
 	st := a.loadTerminalState(s)
 	var remoteBins []string
-	termCtx, remoteBins, _, termErr := a.activeTerminalContext(sessionKey, st)
+	var envInfo *command.EnvInfo
+	termCtx, remoteBins, _, envInfo, termErr := a.activeTerminalContext(sessionKey, st)
 	if termErr != nil {
 		termCtx = nil
 		remoteBins = nil
@@ -605,7 +606,7 @@ func (a *AgentLoop) processDirect(ctx context.Context, message string, sessionKe
 	}
 
 	// Build runtime context (includes model so agent can answer "what model are you using?")
-	runtimeCtx := buildRuntimeContext(channel, chatID, resolvedModel, termCtx, remoteBins)
+	runtimeCtx := buildRuntimeContext(channel, chatID, resolvedModel, termCtx, remoteBins, envInfo)
 	if a.OnTerminalResolved != nil {
 		a.OnTerminalResolved(channel, chatID, formatTerminalLabel(termCtx))
 	}
@@ -1867,42 +1868,121 @@ func (a *AgentLoop) handleSkillCommand(ctx context.Context, sessionKey string, a
 	activeTermName := strings.TrimSpace(termState.Active)
 	activeTerm, hasActiveTerm := termState.Terminals[activeTermName]
 
-	skillList, err := skills.Discover(ws)
+	// Discover local skills
+	localSkillList, err := skills.Discover(ws)
 	if err != nil {
 		return "Error: " + err.Error(), true, ""
 	}
+
+	// Merge skills list
+	allSkills := localSkillList
+
+	// If active remote terminal, discover remote skills
+	if hasActiveTerm && strings.EqualFold(strings.TrimSpace(activeTerm.Type), "ssh") && strings.TrimSpace(activeTerm.SSH.Host) != "" {
+		// Resolve SSH connection info
+		if resolved, err := a.resolveSSHConn(sessionKey, activeTermName, activeTerm.SSH); err == nil {
+			activeTerm.SSH = resolved
+		}
+
+		// Discover remote skills
+		remoteSkillList, err := skills.DiscoverRemoteSkills(ctx, activeTerm.SSH, activeTerm.RemoteHome, activeTermName, sessionKey)
+		if err == nil && len(remoteSkillList) > 0 {
+			// Merge remote skills, remote skills take priority for same name
+			skillMap := make(map[string]skills.Skill)
+			for _, s := range localSkillList {
+				skillMap[strings.ToLower(s.Name)] = s
+			}
+			for _, s := range remoteSkillList {
+				key := strings.ToLower(s.Name)
+				// If local skill with same name exists, remote takes priority
+				skillMap[key] = s
+			}
+
+			// Rebuild list, remote skills first
+			allSkills = make([]skills.Skill, 0, len(skillMap))
+			for _, s := range remoteSkillList {
+				allSkills = append(allSkills, s)
+			}
+			for _, s := range localSkillList {
+				key := strings.ToLower(s.Name)
+				if _, exists := skillMap[key]; exists && !skillMap[key].IsRemote {
+					allSkills = append(allSkills, s)
+				}
+			}
+		}
+	}
+
 	if len(args) == 0 {
-		// /skill — list available skills
-		if len(skillList) == 0 {
+		// /skill — List available skills
+		if len(allSkills) == 0 {
 			return "No skills found. Create workspace/skills/<name>/SKILL.md or install from ClawHub (luckclaw clawhub install <slug>).", true, ""
 		}
+
 		var b strings.Builder
 		b.WriteString("**Available skills:**\n")
-		for _, s := range skillList {
-			state := "available"
-			if !s.Available {
-				state = "unavailable"
+
+		// List remote skills first
+		remoteSkills := []skills.Skill{}
+		localSkills := []skills.Skill{}
+		for _, s := range allSkills {
+			if s.IsRemote {
+				remoteSkills = append(remoteSkills, s)
+			} else {
+				localSkills = append(localSkills, s)
 			}
-			b.WriteString(fmt.Sprintf("  - %s (%s)\n", s.Name, state))
 		}
+
+		if len(remoteSkills) > 0 {
+			b.WriteString("\n**Remote skills:**\n")
+			for _, s := range remoteSkills {
+				state := "available"
+				if !s.Available {
+					state = "unavailable"
+				}
+				b.WriteString(fmt.Sprintf("  - %s (%s) [remote]\n", s.Name, state))
+			}
+		}
+
+		if len(localSkills) > 0 {
+			b.WriteString("\n**Local skills:**\n")
+			for _, s := range localSkills {
+				state := "available"
+				if !s.Available {
+					state = "unavailable"
+				}
+				b.WriteString(fmt.Sprintf("  - %s (%s)\n", s.Name, state))
+			}
+		}
+
 		if hasActiveTerm && strings.EqualFold(strings.TrimSpace(activeTerm.Type), "ssh") && strings.TrimSpace(activeTerm.SSH.Host) != "" {
 			target := activeTerm.SSH.Host
 			if strings.TrimSpace(activeTerm.SSH.User) != "" {
 				target = activeTerm.SSH.User + "@" + activeTerm.SSH.Host
 			}
-			b.WriteString("\nRemote terminal is active (" + activeTermName + " " + target + "). `/skill <name>` will run in a remote workspace and will not touch local files.")
+			b.WriteString("\nRemote terminal is active (" + activeTermName + " " + target + "). Remote skills will be used preferentially.")
 		} else {
 			b.WriteString("\nUse `/skill <name>` to run a skill (e.g. `/skill weather`).")
 		}
 		return b.String(), true, ""
 	}
-	// /skill <name> — run the named skill
+	// /skill <name> — Run specified skill
 	name := strings.TrimSpace(strings.ToLower(args[0]))
-	for _, s := range skillList {
+	for _, s := range allSkills {
 		if strings.ToLower(s.Name) == name {
 			if !s.Available {
 				return fmt.Sprintf("Skill %q is unavailable (missing deps). Use read_file to check %s for requirements.", s.Name, s.Path), true, ""
 			}
+
+			// If remote skill, execute directly (no upload needed)
+			if s.IsRemote {
+				execPrompt := fmt.Sprintf("Please run the %s skill. User requested: /skill %s", s.Name, s.Name)
+				if len(args) > 1 {
+					execPrompt += "\n\n[User additional input: " + strings.Join(args[1:], " ") + "]"
+				}
+				return "", false, execPrompt
+			}
+
+			// If local skill with active remote terminal, upload and execute
 			if hasActiveTerm && strings.EqualFold(strings.TrimSpace(activeTerm.Type), "ssh") && strings.TrimSpace(activeTerm.SSH.Host) != "" {
 				if resolved, err := a.resolveSSHConn(sessionKey, activeTermName, activeTerm.SSH); err == nil {
 					activeTerm.SSH = resolved
@@ -1917,6 +1997,8 @@ func (a *AgentLoop) handleSkillCommand(ctx context.Context, sessionKey string, a
 				_ = a.Sessions.Save(sess)
 				return out, true, ""
 			}
+
+			// Local execution
 			execPrompt := fmt.Sprintf("Please run the %s skill. User requested: /skill %s", s.Name, s.Name)
 			if len(args) > 1 {
 				execPrompt += "\n\n[User additional input: " + strings.Join(args[1:], " ") + "]"
@@ -2401,7 +2483,7 @@ func formatContextLen(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-func buildRuntimeContext(channel, chatID, model string, term *tools.TerminalContext, remoteBins []string) string {
+func buildRuntimeContext(channel, chatID, model string, term *tools.TerminalContext, remoteBins []string, envInfo *command.EnvInfo) string {
 	now := time.Now()
 	tz := now.Location().String()
 	parts := []string{
@@ -2435,6 +2517,41 @@ func buildRuntimeContext(channel, chatID, model string, term *tools.TerminalCont
 		parts = append(parts, fmt.Sprintf("Active Terminal: %s (%s %s)", term.Name, term.Type, target))
 		parts = append(parts, "exec: routed to active terminal (remote)")
 		parts = append(parts, "When Active Terminal is set, use exec to run commands on it (do NOT call ssh tool for that host).")
+		parts = append(parts, "GUI operations: You can run graphical applications on the remote server's display (e.g., open browser, launch apps). Use exec with commands like 'firefox', 'google-chrome', 'xdg-open', etc.")
+
+		// Add environment info
+		if envInfo != nil {
+			parts = append(parts, "Remote Environment:")
+			if envInfo.OS != "" {
+				parts = append(parts, fmt.Sprintf("  OS: %s", envInfo.OS))
+			}
+			if envInfo.Arch != "" {
+				parts = append(parts, fmt.Sprintf("  Arch: %s", envInfo.Arch))
+			}
+			if envInfo.Display != "" {
+				parts = append(parts, fmt.Sprintf("  DISPLAY: %s", envInfo.Display))
+			} else {
+				parts = append(parts, "  DISPLAY: not set")
+			}
+			if envInfo.Desktop != "" {
+				parts = append(parts, fmt.Sprintf("  Desktop: %s", envInfo.Desktop))
+			}
+			if envInfo.Browser != "" {
+				parts = append(parts, fmt.Sprintf("  Browser: %s", envInfo.Browser))
+			}
+			if envInfo.HasGUI {
+				parts = append(parts, "  GUI: available")
+			} else {
+				parts = append(parts, "  GUI: not detected")
+			}
+			// Add special note: macOS has no DISPLAY but has GUI
+			if envInfo.OS == "darwin" && envInfo.Display == "" {
+				parts = append(parts, "  Note: macOS does not use DISPLAY variable but GUI is available. Use 'open' command to launch applications.")
+			}
+		} else {
+			parts = append(parts, "To check if GUI is available: run 'echo $DISPLAY' or 'xdpyinfo' via exec. If DISPLAY is not set, the remote server may need X11 forwarding or a virtual display.")
+		}
+
 		if len(remoteBins) > 0 {
 			parts = append(parts, "Remote capabilities (bins): "+strings.Join(remoteBins, ", "))
 		}

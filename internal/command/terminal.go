@@ -22,6 +22,19 @@ type TerminalEntry struct {
 	RemoteHome   string        `json:"remote_home,omitempty"`
 	SyncedSkills []string      `json:"synced_skills,omitempty"`
 	UpdatedAt    string        `json:"updated_at,omitempty"`
+	EnvInfo      *EnvInfo      `json:"env_info,omitempty"` // Remote terminal environment info
+}
+
+// EnvInfo stores remote terminal environment information
+type EnvInfo struct {
+	OS        string `json:"os,omitempty"`             // OS type (linux, darwin, windows)
+	Arch      string `json:"arch,omitempty"`           // System architecture (amd64, arm64)
+	Display   string `json:"display,omitempty"`        // DISPLAY environment variable
+	Desktop   string `json:"desktop,omitempty"`        // Desktop environment (GNOME, KDE, etc.)
+	Browser   string `json:"browser,omitempty"`        // Default browser
+	HasGUI    bool   `json:"has_gui"`                  // Has GUI
+	Shell     string `json:"shell,omitempty"`          // Default shell
+	UpdatedAt string `json:"env_updated_at,omitempty"` // Environment info update time
 }
 
 type TerminalStore struct {
@@ -434,6 +447,13 @@ func (h *TerminalHandler) useTerminal(args []string, input Input) (Output, error
 		it.RemoteHome = home
 		it.RemoteBins = bins
 		it.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+
+		// Detect environment info
+		envInfo, err := detectRemoteEnvInfo(ensureContext(input.Context), conn, 20*time.Second)
+		if err == nil && envInfo != nil {
+			it.EnvInfo = envInfo
+		}
+
 		st.Terminals[name] = it
 	}
 	st.Active = name
@@ -539,6 +559,13 @@ func (h *TerminalHandler) refreshTerminal(input Input) (Output, error) {
 	it.RemoteHome = home
 	it.RemoteBins = bins
 	it.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+
+	// Detect environment info
+	envInfo, err := detectRemoteEnvInfo(ensureContext(input.Context), conn, 20*time.Second)
+	if err == nil && envInfo != nil {
+		it.EnvInfo = envInfo
+	}
+
 	st.Terminals[active] = it
 	input.Agent.SaveTerminalState(input.SessionKey, st)
 	return Output{Content: fmt.Sprintf("Refreshed remote capabilities for %q: %s", active, strings.Join(bins, ", ")), IsFinal: true}, nil
@@ -855,4 +882,77 @@ func detectRemoteCapabilities(ctx context.Context, c tools.SSHConn, timeout time
 		}
 	}
 	return home, found, nil
+}
+
+// detectRemoteEnvInfo detects remote terminal environment information
+func detectRemoteEnvInfo(ctx context.Context, c tools.SSHConn, timeout time.Duration) (*EnvInfo, error) {
+	c.BatchMode = true
+	// Commands to collect environment info
+	commands := []string{
+		`uname -s`,                        // OS
+		`uname -m`,                        // Architecture
+		`echo "${DISPLAY:-}"`,             // DISPLAY variable
+		`echo "${XDG_CURRENT_DESKTOP:-}"`, // Desktop environment
+		`echo "${SHELL:-}"`,               // Default shell
+		// Detect browsers
+		`command -v firefox >/dev/null 2>&1 && echo "firefox" || true`,
+		`command -v google-chrome >/dev/null 2>&1 && echo "google-chrome" || true`,
+		`command -v chromium-browser >/dev/null 2>&1 && echo "chromium-browser" || true`,
+		`command -v chromium >/dev/null 2>&1 && echo "chromium" || true`,
+		`command -v safari >/dev/null 2>&1 && echo "safari" || true`,
+		`command -v open >/dev/null 2>&1 && echo "open" || true`, // macOS open command
+	}
+
+	out, err := tools.RunSSHCommand(ensureContext(ctx), c, strings.Join(commands, "; "), timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(out, "\n")
+	info := &EnvInfo{
+		UpdatedAt: time.Now().Format(time.RFC3339Nano),
+	}
+
+	// Parse output
+	if len(lines) > 0 {
+		info.OS = strings.TrimSpace(lines[0])
+	}
+	if len(lines) > 1 {
+		info.Arch = strings.TrimSpace(lines[1])
+	}
+	if len(lines) > 2 {
+		info.Display = strings.TrimSpace(lines[2])
+	}
+	if len(lines) > 3 {
+		info.Desktop = strings.TrimSpace(lines[3])
+	}
+	if len(lines) > 4 {
+		info.Shell = strings.TrimSpace(lines[4])
+	}
+
+	// Detect browsers
+	var browsers []string
+	for i := 5; i < len(lines); i++ {
+		b := strings.TrimSpace(lines[i])
+		if b != "" {
+			browsers = append(browsers, b)
+		}
+	}
+	if len(browsers) > 0 {
+		info.Browser = browsers[0] // Use first detected browser
+	}
+
+	// Determine if GUI is available
+	// macOS doesn't have DISPLAY variable but has GUI
+	// Linux needs DISPLAY variable or desktop environment
+	info.HasGUI = false
+	if info.OS == "darwin" {
+		// macOS always has GUI
+		info.HasGUI = true
+	} else if info.Display != "" || info.Desktop != "" {
+		// Linux has DISPLAY or desktop environment
+		info.HasGUI = true
+	}
+
+	return info, nil
 }
