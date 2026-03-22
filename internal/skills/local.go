@@ -17,6 +17,7 @@ type Skill struct {
 	Available   bool
 	Requires    Requires
 	Always      bool
+	IsRemote    bool // Mark as remote skill
 }
 
 type Requires struct {

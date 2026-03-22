@@ -97,10 +97,10 @@ type AgentDefaults struct {
 	Temperature          float64 `json:"temperature"`
 	MaxToolIterations    int     `json:"maxToolIterations"`
 	ReasoningEffort      string  `json:"reasoningEffort,omitempty"`
-	MemoryWindow         int     `json:"memoryWindow,omitempty"`         // 消息数阈值（fallback）
-	MemoryWindowTokens   int     `json:"memoryWindowTokens,omitempty"`   // Token 阈值（优先）
-	MaxContextTokens     int     `json:"maxContextTokens,omitempty"`     // 上下文总 token 截断阈值
-	MaxMemoryInjectChars int     `json:"maxMemoryInjectChars,omitempty"` // 记忆注入字符上限
+	MemoryWindow         int     `json:"memoryWindow,omitempty"`         // Message count threshold (fallback)
+	MemoryWindowTokens   int     `json:"memoryWindowTokens,omitempty"`   // Token threshold (preferred)
+	MaxContextTokens     int     `json:"maxContextTokens,omitempty"`     // Total context token truncation threshold
+	MaxMemoryInjectChars int     `json:"maxMemoryInjectChars,omitempty"` // Memory injection character limit
 	MaxMessages          int     `json:"maxMessages,omitempty"`
 	ConsolidationTimeout int     `json:"consolidationTimeout,omitempty"`
 	MaxRetries           int     `json:"maxRetries,omitempty"`
